@@ -1,0 +1,4653 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  application/
+    config.py
+    employee_master.py
+    leave.py
+    payroll.py
+    sales.py
+  assets/
+    icon.png
+  attendance/
+    __init__.py
+    analytics.py
+    engine.py
+    parser.py
+  reporting/
+    __init__.py
+    excel_report.py
+    payslip.py
+  services/
+    file_engine.py
+    models.py
+    pipeline.py
+  ui/
+    page.py
+    state.py
+  main.py
+tests/
+  test_main.py
+.gitignore
+architecture.md
+pyproject.toml
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/application/config.py">
+"""
+Configuration objects for the HR dashboard.
+
+Every business rule that can plausibly change (schedules, tolerance, payroll
+rates, score thresholds, sales scoring weights) lives here instead of being
+hard-coded inside the calculation engines. Nothing in this module invents a
+monetary/business rule that HR has not supplied: payroll rates default to
+``None`` and the payroll engine refuses to fabricate a deduction amount when
+a rate is missing (see ``hrdash.payroll``).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+from datetime import date, datetime, time
+from typing import Optional
+
+import polars as pl
+
+CONFIG_SHEET_NAME = "CONFIG"
+
+# ---------------------------------------------------------------------------
+# Attendance schedule configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AttendanceConfig:
+    """Working-hours / tolerance rules. Preserves the original semantics:
+    first scan of the day = clock-in, last scan of the day = clock-out.
+    """
+
+    clock_in: time = time(7, 55)
+    weekday_clock_out: time = time(17, 0)
+    saturday_clock_out: time = time(14, 0)
+    grace_minutes: int = 10
+    single_scan_cutoff: time = time(12, 0)
+    sunday_is_off: bool = True
+    saturday_is_working: bool = True
+    # Used only to flag an obvious missing-punch case where the *only* scan
+    # of the day happens to have fallen before the cutoff (i.e. read as an
+    # unmatched clock-in). Kept configurable rather than assumed.
+    default_late_minutes_when_only_clock_out: int = 60
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+    @property
+    def working_days(self) -> set[str]:
+        days = {"Senin", "Selasa", "Rabu", "Kamis", "Jumat"}
+        if self.saturday_is_working:
+            days.add("Sabtu")
+        if not self.sunday_is_off:
+            days.add("Minggu")
+        return days
+
+
+# ---------------------------------------------------------------------------
+# HR classification / scoring thresholds (Section 6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScoreConfig:
+    """Attendance-score classification bands. Configurable, not hard-coded."""
+
+    excellent_threshold: float = 90.0
+    good_threshold: float = 80.0
+    watch_threshold: float = 70.0
+
+    def classify(self, score: float) -> str:
+        if score >= self.excellent_threshold:
+            return "EXCELLENT"
+        if score >= self.good_threshold:
+            return "GOOD"
+        if score >= self.watch_threshold:
+            return "WATCH"
+        return "ATTENTION"
+
+
+# ---------------------------------------------------------------------------
+# Payroll configuration (Section 7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PayrollConfig:
+    """Payroll deduction rules.
+
+    All rates default to ``None`` on purpose: the spec explicitly forbids
+    assuming a deduction nominal that HR has not defined. When a rate is
+    ``None`` the payroll engine reports the deduction as "Belum Diatur"
+    (not configured) and excludes it from the total instead of guessing.
+    """
+
+    late_deduction_mode: str = "per_minute"  # "per_minute" or "per_occurrence"
+    late_deduction_per_minute: Optional[float] = None
+    late_deduction_per_occurrence: Optional[float] = None
+    sales_no_clock_out_deduction: Optional[float] = None
+    early_leave_deduction_per_minute: Optional[float] = None
+    absence_deduction_per_day: Optional[float] = None
+    other_deduction_note: str = ""
+
+    @property
+    def is_configured(self) -> bool:
+        return any(
+            v is not None
+            for v in (
+                self.late_deduction_per_minute,
+                self.late_deduction_per_occurrence,
+                self.sales_no_clock_out_deduction,
+                self.early_leave_deduction_per_minute,
+                self.absence_deduction_per_day,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sales performance scoring configuration (Section 4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SalesScoreConfig:
+    """Weights used to blend sales KPIs into a single Performance Score.
+
+    Weights must sum to a positive number; they are normalised internally.
+    Defaults give equal-ish emphasis to funnel volume and outcomes and are
+    clearly documented in the README sheet so HR can tune them without
+    touching code.
+    """
+
+    weight_visit: float = 0.15
+    weight_test_drive: float = 0.15
+    weight_spk: float = 0.30
+    weight_delivery: float = 0.25
+    weight_conversion_rate: float = 0.15
+
+    excellent_threshold: float = 85.0
+    good_threshold: float = 70.0
+    attention_threshold: float = 50.0
+
+    def classify(self, score: float) -> str:
+        if score >= self.excellent_threshold:
+            return "Excellent"
+        if score >= self.good_threshold:
+            return "Good"
+        if score >= self.attention_threshold:
+            return "Watch"
+        return "Attention"
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    attendance: AttendanceConfig = field(default_factory=AttendanceConfig)
+    score: ScoreConfig = field(default_factory=ScoreConfig)
+    payroll: PayrollConfig = field(default_factory=PayrollConfig)
+    sales_score: SalesScoreConfig = field(default_factory=SalesScoreConfig)
+
+
+# ---------------------------------------------------------------------------
+# CONFIG sheet <-> dataclasses round-trip
+# ---------------------------------------------------------------------------
+
+_TIME_FIELDS = {"clock_in", "weekday_clock_out", "saturday_clock_out", "single_scan_cutoff"}
+_DATE_FIELDS = {"start_date", "end_date"}
+_BOOL_FIELDS = {"sunday_is_off", "saturday_is_working"}
+
+_SECTION_LABELS = {
+    "attendance": "Jadwal & Toleransi",
+    "score": "Klasifikasi Skor Kehadiran",
+    "payroll": "Payroll",
+    "sales_score": "Bobot Skor Performa Sales",
+}
+
+_FIELD_DESCRIPTIONS = {
+    "clock_in": "Jam masuk resmi",
+    "weekday_clock_out": "Jam pulang Senin-Jumat",
+    "saturday_clock_out": "Jam pulang Sabtu",
+    "grace_minutes": "Toleransi keterlambatan (menit)",
+    "single_scan_cutoff": "Batas waktu untuk membedakan scan tunggal pagi/sore",
+    "sunday_is_off": "Minggu libur? (Ya/Tidak)",
+    "saturday_is_working": "Sabtu hari kerja? (Ya/Tidak)",
+    "default_late_minutes_when_only_clock_out": "Estimasi menit telat saat hanya ada scan pulang",
+    "start_date": "Tanggal mulai periode perhitungan (kosongkan = otomatis dari data)",
+    "end_date": "Tanggal akhir periode perhitungan (kosongkan = otomatis dari data)",
+    "excellent_threshold": "Ambang batas skor EXCELLENT / Good",
+    "good_threshold": "Ambang batas skor GOOD",
+    "watch_threshold": "Ambang batas skor WATCH (di bawah ini = ATTENTION)",
+    "late_deduction_mode": "Metode potongan telat (per_minute / per_occurrence)",
+    "late_deduction_per_minute": "Tarif potongan per menit terlambat (kosongkan jika belum ditentukan)",
+    "late_deduction_per_occurrence": "Tarif potongan per 1x terlambat (kosongkan jika belum ditentukan)",
+    "sales_no_clock_out_deduction": "Tarif potongan per 1x tidak absen pulang tim Sales (kosongkan jika belum ditentukan)",
+    "early_leave_deduction_per_minute": "Tarif potongan per menit pulang cepat (kosongkan jika belum ditentukan)",
+    "absence_deduction_per_day": "Potongan per hari mangkir (kosongkan jika belum ditentukan)",
+    "other_deduction_note": "Catatan potongan lain-lain",
+    "weight_visit": "Bobot Customer Visit",
+    "weight_test_drive": "Bobot Test Drive",
+    "weight_spk": "Bobot SPK",
+    "weight_delivery": "Bobot Delivery",
+    "weight_conversion_rate": "Bobot Conversion Rate",
+    "attention_threshold": "Ambang batas skor Watch/Attention",
+}
+
+
+def _fmt_value(name: str, value) -> object:
+    if value is None:
+        return ""
+    if name in _TIME_FIELDS and isinstance(value, time):
+        return value.strftime("%H:%M")
+    if name in _DATE_FIELDS and isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if name in _BOOL_FIELDS:
+        return "Ya" if value else "Tidak"
+    return value
+
+
+def config_to_dataframe(cfg: AppConfig) -> pl.DataFrame:
+    """Flatten AppConfig into a human-editable Parameter/Value table."""
+    rows: list[dict] = []
+    for section_name in ("attendance", "score", "payroll", "sales_score"):
+        section_obj = getattr(cfg, section_name)
+        for f in fields(section_obj):
+            rows.append(
+                {
+                    "Section": _SECTION_LABELS[section_name],
+                    "Parameter": f.name,
+                    "Value": str(_fmt_value(f.name, getattr(section_obj, f.name))),
+                    "Description": _FIELD_DESCRIPTIONS.get(f.name, ""),
+                }
+            )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "Section": pl.String,
+            "Parameter": pl.String,
+            "Value": pl.String,
+            "Description": pl.String,
+        },
+    )
+
+
+def _parse_value(name: str, raw: object):
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return None
+    if name in _TIME_FIELDS:
+        if isinstance(raw, time):
+            return raw
+        text = str(raw).strip()
+        parts = text.replace(".", ":").split(":")
+        return time(int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    if name in _DATE_FIELDS:
+        if isinstance(raw, (date, datetime)):
+            return raw.date() if isinstance(raw, datetime) else raw
+        txt = str(raw).strip()[:10]
+        try:
+            return datetime.strptime(txt, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    if name in _BOOL_FIELDS:
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"ya", "yes", "true", "1"}
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw == "":
+            return None
+    try:
+        return float(raw) if "." in str(raw) else int(raw)
+    except (ValueError, TypeError):
+        return raw
+
+
+def config_from_dataframe(df: pl.DataFrame | object) -> AppConfig:
+    """Rebuild an AppConfig from a previously exported CONFIG sheet.
+
+    Unknown or malformed rows are ignored; missing rows fall back to
+    dataclass defaults so a partial CONFIG sheet never crashes the app.
+    """
+    values: dict[str, dict] = {"attendance": {}, "score": {}, "payroll": {}, "sales_score": {}}
+    section_by_label = {v: k for k, v in _SECTION_LABELS.items()}
+
+    if isinstance(df, pl.DataFrame):
+        rows_iter = df.iter_rows(named=True)
+    elif hasattr(df, "to_dicts"):
+        rows_iter = df.to_dicts()
+    elif hasattr(df, "iterrows"):
+        rows_iter = (r.to_dict() for _, r in df.iterrows())
+    else:
+        rows_iter = []
+
+    for row in rows_iter:
+        section_key = section_by_label.get(str(row.get("Section", "")).strip())
+        param = str(row.get("Parameter", "")).strip()
+        if not section_key or not param:
+            continue
+        try:
+            values[section_key][param] = _parse_value(param, row.get("Value"))
+        except Exception:
+            continue
+
+    def build(cls, overrides: dict):
+        valid = {f.name for f in fields(cls)}
+        kwargs = {k: v for k, v in overrides.items() if k in valid and v is not None}
+        return cls(**kwargs)
+
+    return AppConfig(
+        attendance=build(AttendanceConfig, values["attendance"]),
+        score=build(ScoreConfig, values["score"]),
+        payroll=build(PayrollConfig, values["payroll"]),
+        sales_score=build(SalesScoreConfig, values["sales_score"]),
+    )
+</file>
+
+<file path="src/application/employee_master.py">
+"""
+Employee Master (Section 9).
+
+Employee Type detection: if ``Department`` contains "SALES" the employee
+defaults to type SALES, otherwise OFFICE — but HR can always override this
+via the ``Employee_Type`` column in the uploaded master file, as required
+by the spec.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import io
+from typing import Optional
+
+import polars as pl
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.worksheet.datavalidation import DataValidation
+
+EMPLOYEE_MASTER_COLUMNS = [
+    "No.",
+    "Name",
+    "Department",
+    "Position",
+    "Employee_Type",
+    "Jam_Masuk",
+    "Jam_Pulang",
+    "Monthly_Salary",
+    "Active",
+]
+
+EMPLOYEE_MASTER_SCHEMA = {
+    "No.": pl.String,
+    "Name": pl.String,
+    "Department": pl.String,
+    "Position": pl.String,
+    "Employee_Type": pl.String,
+    "Jam_Masuk": pl.String,
+    "Jam_Pulang": pl.String,
+    "Monthly_Salary": pl.Float64,
+    "Active": pl.Boolean,
+}
+
+VALID_EMPLOYEE_TYPES = {"OFFICE", "SALES"}
+
+NAVY = "1F4E78"
+WHITE = "FFFFFF"
+
+
+class EmployeeMasterError(ValueError):
+    """Raised when the uploaded employee master file is malformed."""
+
+
+def _clean_col(name: object) -> str:
+    return str(name).replace("\n", " ").strip()
+
+
+def _parse_time_str(val: object) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, (dt.time,)):
+        return val.strftime("%H:%M")
+    if isinstance(val, (dt.datetime,)):
+        return val.strftime("%H:%M")
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "nat", "<null>", ""):
+        return None
+    s = s.replace(".", ":")
+    parts = s.split(":")
+    if len(parts) >= 2:
+        try:
+            h = int(parts[0])
+            m = int(parts[1])
+            return f"{h:02d}:{m:02d}"
+        except ValueError:
+            return None
+    return None
+
+
+def detect_employee_type(department: Optional[str]) -> str:
+    if department and "sales" in str(department).lower():
+        return "SALES"
+    return "OFFICE"
+
+
+def load_employee_master(raw_input: Optional[pl.DataFrame]) -> pl.DataFrame:
+    """Validate and normalize an uploaded Employee Master file.
+
+    Returns a Polars DataFrame with exactly ``EMPLOYEE_MASTER_COLUMNS``, one row
+    per unique Employee ID (last occurrence wins so HR can re-upload an
+    updated file). Missing optional fields are filled with safe defaults;
+    ``No.`` is mandatory.
+    """
+    if raw_input is None or raw_input.is_empty():
+        return pl.DataFrame(schema=EMPLOYEE_MASTER_SCHEMA)
+
+    df = raw_input
+    rename_map = {c: _clean_col(c) for c in df.columns}
+    df = df.rename(rename_map)
+
+    id_col = next((c for c in ["No.", "Employee ID", "ID", "NIK"] if c in df.columns), None)
+    if id_col is None:
+        raise EmployeeMasterError(
+            "Employee Master harus memiliki kolom employee ID (No./Employee ID/ID/NIK)."
+        )
+
+    # 1. No.
+    s_no = df[id_col].cast(pl.String).str.strip_chars()
+
+    # 2. Name
+    if "Name" in df.columns:
+        s_name = df["Name"].cast(pl.String).str.strip_chars()
+    else:
+        s_name = pl.Series("Name", [None] * len(df), dtype=pl.String)
+
+    # 3. Department
+    if "Department" in df.columns:
+        s_dept = df["Department"].cast(pl.String).str.strip_chars()
+    else:
+        s_dept = pl.Series("Department", [None] * len(df), dtype=pl.String)
+
+    # 4. Position
+    if "Position" in df.columns:
+        s_pos = df["Position"].cast(pl.String).str.strip_chars()
+    else:
+        s_pos = pl.Series("Position", [None] * len(df), dtype=pl.String)
+
+    # 5. Employee Type
+    if "Employee_Type" in df.columns:
+        s_etype = df["Employee_Type"].cast(pl.String).str.strip_chars().str.to_uppercase()
+    elif "Employee Type" in df.columns:
+        s_etype = df["Employee Type"].cast(pl.String).str.strip_chars().str.to_uppercase()
+    else:
+        s_etype = pl.Series("Employee_Type", [None] * len(df), dtype=pl.String)
+
+    # 6. Jam_Masuk & Jam_Pulang
+    in_col = next(
+        (c for c in ["Jam_Masuk", "Jam Masuk", "Jam_Kerja_Masuk", "Jam Kerja Masuk", "In", "Clock_In", "Clock In"] if c in df.columns),
+        None,
+    )
+    out_col = next(
+        (c for c in ["Jam_Pulang", "Jam Pulang", "Jam_Kerja_Pulang", "Jam Kerja Pulang", "Out", "Clock_Out", "Clock Out"] if c in df.columns),
+        None,
+    )
+    range_col = next(
+        (c for c in ["Jam_Kerja", "Jam Kerja", "Range_Jam_Kerja", "Schedule", "Jadwal"] if c in df.columns),
+        None,
+    )
+
+    if in_col is not None:
+        in_list = [_parse_time_str(v) for v in df[in_col].to_list()]
+    elif range_col is not None:
+        def _get_start(val):
+            if val is None:
+                return None
+            txt = str(val)
+            for sep in ["-", "s/d", "to"]:
+                if sep in txt:
+                    return _parse_time_str(txt.split(sep)[0])
+            return _parse_time_str(txt)
+        in_list = [_get_start(v) for v in df[range_col].to_list()]
+    else:
+        in_list = [None] * len(df)
+
+    if out_col is not None:
+        out_list = [_parse_time_str(v) for v in df[out_col].to_list()]
+    elif range_col is not None:
+        def _get_end(val):
+            if val is None:
+                return None
+            txt = str(val)
+            for sep in ["-", "s/d", "to"]:
+                if sep in txt:
+                    return _parse_time_str(txt.split(sep)[1])
+            return None
+        out_list = [_get_end(v) for v in df[range_col].to_list()]
+    else:
+        out_list = [None] * len(df)
+
+    s_in = pl.Series("Jam_Masuk", in_list, dtype=pl.String)
+    s_out = pl.Series("Jam_Pulang", out_list, dtype=pl.String)
+
+    # 7. Monthly_Salary
+    if "Monthly_Salary" in df.columns:
+        s_salary = df["Monthly_Salary"].cast(pl.Float64, strict=False)
+    elif "Monthly Salary" in df.columns:
+        s_salary = df["Monthly Salary"].cast(pl.Float64, strict=False)
+    else:
+        s_salary = pl.Series("Monthly_Salary", [None] * len(df), dtype=pl.Float64)
+
+    # 8. Active
+    if "Active" in df.columns:
+        s_act_raw = df["Active"].cast(pl.String).str.strip_chars().str.to_lowercase()
+        s_active = ~s_act_raw.is_in(["n", "no", "tidak", "0", "false", "inactive"])
+    else:
+        s_active = pl.Series("Active", [True] * len(df), dtype=pl.Boolean)
+
+    out = pl.DataFrame(
+        [s_no.alias("No."), s_name.alias("Name"), s_dept.alias("Department"),
+         s_pos.alias("Position"), s_etype.alias("Employee_Type"),
+         s_in.alias("Jam_Masuk"), s_out.alias("Jam_Pulang"),
+         s_salary.alias("Monthly_Salary"), s_active.alias("Active")]
+    )
+
+    out = out.filter(pl.col("No.").is_not_null() & (pl.col("No.") != ""))
+
+    # Fallback Employee_Type from Department
+    out = out.with_columns(
+        Employee_Type=pl.when(
+            pl.col("Employee_Type").is_in(list(VALID_EMPLOYEE_TYPES))
+        )
+        .then(pl.col("Employee_Type"))
+        .otherwise(
+            pl.when(pl.col("Department").str.to_lowercase().str.contains("sales"))
+            .then(pl.lit("SALES"))
+            .otherwise(pl.lit("OFFICE"))
+        ),
+        Name=pl.when(pl.col("Name").is_null() | (pl.col("Name") == ""))
+        .then(pl.concat_str([pl.lit("Karyawan "), pl.col("No.")]))
+        .otherwise(pl.col("Name")),
+        Department=pl.when(pl.col("Department").is_null() | (pl.col("Department") == ""))
+        .then(pl.lit("Belum Dipetakan"))
+        .otherwise(pl.col("Department")),
+        Position=pl.when(pl.col("Position").is_null()).then(pl.lit("")).otherwise(pl.col("Position")),
+    )
+
+    out = out.unique(subset=["No."], keep="last")
+    return out.select(EMPLOYEE_MASTER_COLUMNS)
+
+
+def merge_master_into_log(
+    clean_log: pl.DataFrame, master: Optional[pl.DataFrame]
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Enrich attendance rows with employee master identity/type/schedule.
+
+    Where an employee exists in the raw log but not in the master file, the
+    identity fields already present on the log (or safe fallbacks) are kept
+    and the employee is flagged in the returned "unmapped" DataFrame so HR
+    can extend the master file. No attendance rows are dropped.
+    """
+    clean = clean_log
+    if master is None or master.is_empty():
+        enriched = clean.with_columns(
+            Employee_Type=pl.when(pl.col("Department").str.to_lowercase().str.contains("sales"))
+            .then(pl.lit("SALES"))
+            .otherwise(pl.lit("OFFICE")),
+            Position=pl.lit(""),
+            Jam_Masuk_Master=pl.lit(None, dtype=pl.String),
+            Jam_Pulang_Master=pl.lit(None, dtype=pl.String),
+        )
+        unmapped = enriched.select(["No.", "Name", "Department"]).unique()
+        return enriched, unmapped
+
+    m = master
+
+    # Master columns to join
+    m_cols = ["No.", "Name", "Department", "Employee_Type", "Position"]
+    if "Jam_Masuk" in m.columns:
+        m_cols.append("Jam_Masuk")
+    if "Jam_Pulang" in m.columns:
+        m_cols.append("Jam_Pulang")
+
+    m_subset = m.select(m_cols)
+    m_renamed = m_subset.rename(
+        {
+            "Name": "_m_Name",
+            "Department": "_m_Department",
+            "Employee_Type": "_m_Employee_Type",
+            "Position": "_m_Position",
+            **({"Jam_Masuk": "Jam_Masuk_Master"} if "Jam_Masuk" in m_cols else {}),
+            **({"Jam_Pulang": "Jam_Pulang_Master"} if "Jam_Pulang" in m_cols else {}),
+        }
+    )
+
+    joined = clean.join(m_renamed, on="No.", how="left")
+
+    if "Jam_Masuk_Master" not in joined.columns:
+        joined = joined.with_columns(Jam_Masuk_Master=pl.lit(None, dtype=pl.String))
+    if "Jam_Pulang_Master" not in joined.columns:
+        joined = joined.with_columns(Jam_Pulang_Master=pl.lit(None, dtype=pl.String))
+
+    # Master identity wins for Name / Department if present
+    enriched = joined.with_columns(
+        Name=pl.coalesce([pl.col("_m_Name"), pl.col("Name")]),
+        Department=pl.coalesce([pl.col("_m_Department"), pl.col("Department")]),
+        Position=pl.coalesce([pl.col("_m_Position"), pl.lit("")]),
+        Employee_Type=pl.coalesce(
+            [
+                pl.col("_m_Employee_Type"),
+                pl.when(pl.col("Department").str.to_lowercase().str.contains("sales"))
+                .then(pl.lit("SALES"))
+                .otherwise(pl.lit("OFFICE")),
+            ]
+        ),
+    ).drop(["_m_Name", "_m_Department", "_m_Employee_Type", "_m_Position"])
+
+    master_ids = set(m["No."].to_list())
+    unmapped = (
+        enriched.filter(~pl.col("No.").is_in(master_ids))
+        .select(["No.", "Name", "Department"])
+        .unique()
+    )
+    return enriched, unmapped
+
+
+def build_employee_master_template() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Employee Master"
+    guide = wb.create_sheet("Petunjuk")
+
+    ws.append(EMPLOYEE_MASTER_COLUMNS)
+    ws.append(["EMP001", "Budi Santoso", "Sales Mobil Baru", "Sales Executive", "SALES", "08:30", "17:30", 5500000, "Y"])
+    ws.append(["EMP002", "Sari Wijaya", "HRD & Admin", "Staff HRD", "OFFICE", "08:00", "17:00", 6000000, "Y"])
+
+    header_fill = PatternFill("solid", fgColor=NAVY)
+    header_font = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
+    body_font = Font(name="Segoe UI", size=10, color="1F2937")
+    thin = Side(style="thin", color="D1D5DB")
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = Border(bottom=thin)
+
+    for row in ws.iter_rows(min_row=2, max_row=1000, max_col=len(EMPLOYEE_MASTER_COLUMNS)):
+        for cell in row:
+            cell.font = body_font
+            cell.border = Border(bottom=thin)
+
+    dv_type = DataValidation(type="list", formula1='"OFFICE,SALES"', allow_blank=True)
+    dv_type.error = "Pilih OFFICE atau SALES."
+    dv_type.errorTitle = "Employee Type tidak valid"
+    ws.add_data_validation(dv_type)
+    dv_type.add("E2:E1000")
+
+    dv_active = DataValidation(type="list", formula1='"Y,N"', allow_blank=True)
+    ws.add_data_validation(dv_active)
+    dv_active.add("I2:I1000")
+
+    widths = {"A": 14, "B": 22, "C": 20, "D": 20, "E": 14, "F": 14, "G": 14, "H": 16, "I": 10}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = "A1:I1000"
+
+    guide_rows = [
+        ["PETUNJUK EMPLOYEE MASTER"],
+        ["No.", "Employee ID — harus sama dengan kolom No. pada export mesin absensi."],
+        ["Name", "Nama karyawan."],
+        ["Department", "Departemen/divisi."],
+        ["Position", "Jabatan (opsional)."],
+        ["Employee_Type", "OFFICE atau SALES. Jika dikosongkan, sistem menebak dari Department (mengandung 'SALES')."],
+        ["Jam_Masuk", "Jam masuk resmi per divisi/karyawan (format HH:MM, contoh: 08:30). Jika dikosongkan, mengikuti jadwal dashboard."],
+        ["Jam_Pulang", "Jam pulang resmi per divisi/karyawan (format HH:MM, contoh: 17:30). Jika dikosongkan, mengikuti jadwal dashboard."],
+        ["Monthly_Salary", "Gaji bulanan untuk perhitungan payroll (opsional, angka saja)."],
+        ["Active", "Y = aktif, N = non-aktif. Karyawan non-aktif tetap dihitung di riwayat tapi ditandai."],
+    ]
+    for row in guide_rows:
+        guide.append(row)
+    guide["A1"].font = Font(name="Segoe UI", size=14, bold=True, color=WHITE)
+    guide["A1"].fill = header_fill
+    guide.merge_cells("A1:B1")
+    for row in guide.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = body_font
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    guide.column_dimensions["A"].width = 18
+    guide.column_dimensions["B"].width = 90
+
+    output = io.BytesIO()
+    wb.save(output)
+    return output.getvalue()
+</file>
+
+<file path="src/application/leave.py">
+"""
+hrdash.leave
+============
+Modul terintegrasi untuk menangani template Excel dan pemrosesan data Cuti,
+Lembur & Kegiatan Bersama (Lembur Bersama / Libur Bersama).
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import io
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.worksheet.datavalidation import DataValidation
+import polars as pl
+
+from services.file_engine import read_workbook_sheets, extension_of, validate_extension
+
+NAVY = "1F4E78"
+WHITE = "FFFFFF"
+LIGHT_GRAY = "F2F2F2"
+
+# --------------------------------------------------------------------------
+# Constant & Enum Definitions
+# --------------------------------------------------------------------------
+
+SHEET_CUTI_IZIN = "Cuti_Izin"
+SHEET_LEMBUR_KARYAWAN = "Lembur_Karyawan"
+SHEET_KEGIATAN_BERSAMA = "Kegiatan_Bersama"
+
+
+class ApprovalStatus(str, Enum):
+    APPROVED = "Approved"
+    PENDING = "Pending"
+    REJECTED = "Rejected"
+
+    @classmethod
+    def parse(cls, raw: object) -> Optional["ApprovalStatus"]:
+        if raw is None:
+            return None
+        text = str(raw).strip().lower()
+        for member in cls:
+            if member.value.lower() == text:
+                return member
+        if text in ("ya", "yes", "setuju", "disetujui", "ok", "1", "true"):
+            return cls.APPROVED
+        if text in ("tidak", "no", "ditolak", "reject"):
+            return cls.REJECTED
+        return None
+
+
+class GroupEventType(str, Enum):
+    LIBUR_BERSAMA = "Libur Bersama"
+    LEMBUR_BERSAMA = "Lembur Bersama"
+
+    @classmethod
+    def parse(cls, raw: object) -> Optional["GroupEventType"]:
+        if raw is None:
+            return None
+        text = str(raw).strip().lower()
+        if "lembur" in text or "event" in text or "kegiatan" in text or "pameran" in text:
+            return cls.LEMBUR_BERSAMA
+        if "libur" in text or "cuti" in text:
+            return cls.LIBUR_BERSAMA
+        for member in cls:
+            if member.value.lower() == text:
+                return member
+        return None
+
+
+# --------------------------------------------------------------------------
+# Dataclasses
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LeaveRecord:
+    employee_id: str
+    name: Optional[str]
+    start_date: dt.date
+    end_date: dt.date
+    leave_type: str
+    status: ApprovalStatus
+    note: Optional[str]
+    source_row: int
+
+    def dates(self) -> list[dt.date]:
+        return _date_range(self.start_date, self.end_date)
+
+
+@dataclass(frozen=True)
+class OvertimeRecord:
+    employee_id: str
+    name: Optional[str]
+    date: dt.date
+    start_time: dt.time
+    end_time: dt.time
+    duration_hours: float
+    status: ApprovalStatus
+    note: Optional[str]
+    source_row: int
+
+
+@dataclass(frozen=True)
+class GroupEvent:
+    start_date: dt.date
+    end_date: dt.date
+    name: str
+    event_type: GroupEventType
+    duration_hours: float = 8.0
+    scope: str = "Semua Karyawan"
+    note: Optional[str] = None
+    source_row: int = 0
+
+    def dates(self) -> list[dt.date]:
+        return _date_range(self.start_date, self.end_date)
+
+
+@dataclass(frozen=True)
+class RejectedRow:
+    sheet: str
+    row: int
+    reason: str
+    raw: dict
+
+
+@dataclass
+class LeaveLoadResult:
+    leaves: list[LeaveRecord] = field(default_factory=list)
+    overtimes: list[OvertimeRecord] = field(default_factory=list)
+    group_events: list[GroupEvent] = field(default_factory=list)
+    rejected: list[RejectedRow] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
+# Template Generator
+# --------------------------------------------------------------------------
+
+def build_leave_template() -> bytes:
+    """Membuat template Excel 3 sheet profesional:
+    1. Cuti_Izin (per karyawan)
+    2. Lembur_Karyawan (per karyawan)
+    3. Kegiatan_Bersama (global: Lembur Bersama / Libur Bersama)
+    4. Petunjuk
+    """
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # Remove default blank sheet
+
+    header_fill = PatternFill("solid", fgColor=NAVY)
+    header_font = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
+    body_font = Font(name="Segoe UI", size=10, color="1F2937")
+    thin = Side(style="thin", color="D1D5DB")
+
+    def _style_sheet(ws, widths: dict[str, int]):
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(bottom=thin)
+        for row in ws.iter_rows(min_row=2, max_row=500, max_col=len(widths)):
+            for cell in row:
+                cell.font = body_font
+                cell.border = Border(bottom=thin)
+        for col_letter, w in widths.items():
+            ws.column_dimensions[col_letter].width = w
+        ws.freeze_panes = "A2"
+        last_col_letter = list(widths.keys())[-1]
+        ws.auto_filter.ref = f"A1:{last_col_letter}500"
+
+    # 1. Cuti_Izin
+    ws_cuti = wb.create_sheet(title=SHEET_CUTI_IZIN)
+    ws_cuti.append(["No.", "Nama", "Tanggal Mulai", "Tanggal Selesai", "Jumlah Hari", "Leave Type", "Status Approval", "Keterangan"])
+    ws_cuti.append(["EMP001", "Budi Santoso", "2026-09-10", "2026-09-11", 2, "Cuti Tahunan", "Approved", "Cuti tahunan keperluan keluarga"])
+    ws_cuti.append(["EMP002", "Sari Wijaya", "2026-09-18", "2026-09-18", 1, "Izin Sakit", "Approved", "Surat dokter terlampir"])
+    _style_sheet(ws_cuti, {"A": 14, "B": 22, "C": 16, "D": 16, "E": 14, "F": 18, "G": 16, "H": 30})
+
+    dv_status = DataValidation(type="list", formula1='"Approved,Pending,Rejected"', allow_blank=True)
+    ws_cuti.add_data_validation(dv_status)
+    dv_status.add("G2:G500")
+
+    # 2. Lembur_Karyawan
+    ws_lembur = wb.create_sheet(title=SHEET_LEMBUR_KARYAWAN)
+    ws_lembur.append(["No.", "Nama", "Tanggal", "Jam Mulai Lembur", "Jam Selesai Lembur", "Durasi (Jam)", "Status Approval", "Keterangan / Alasan Lembur"])
+    ws_lembur.append(["EMP001", "Budi Santoso", "2026-09-12", "17:00", "20:00", 3.0, "Approved", "Closing rekap akhir pekan"])
+    ws_lembur.append(["EMP002", "Sari Wijaya", "2026-09-21", "17:00", "19:30", 2.5, "Approved", "Rekap payroll bulanan"])
+    _style_sheet(ws_lembur, {"A": 14, "B": 22, "C": 16, "D": 18, "E": 18, "F": 14, "G": 16, "H": 35})
+
+    dv_lembur_status = DataValidation(type="list", formula1='"Approved,Pending,Rejected"', allow_blank=True)
+    ws_lembur.add_data_validation(dv_lembur_status)
+    dv_lembur_status.add("G2:G500")
+
+    # 3. Kegiatan_Bersama
+    ws_kegiatan = wb.create_sheet(title=SHEET_KEGIATAN_BERSAMA)
+    ws_kegiatan.append(["Tanggal Mulai", "Tanggal Selesai", "Nama Kegiatan / Event", "Jenis Pencatatan", "Durasi Lembur (Jam)", "Cakupan Karyawan", "Keterangan"])
+    ws_kegiatan.append(["2026-09-15", "2026-09-15", "Pameran Launching Mall", "Lembur Bersama", 8.0, "Semua Karyawan", "Event pameran mobil di mall, karyawan tidak scan di kantor"])
+    ws_kegiatan.append(["2026-12-24", "2026-12-24", "Cuti Bersama Nasional", "Libur Bersama", 0.0, "Semua Karyawan", "Hari libur / cuti bersama perusahaan"])
+    _style_sheet(ws_kegiatan, {"A": 16, "B": 16, "C": 28, "D": 20, "E": 20, "F": 20, "G": 40})
+
+    dv_jenis = DataValidation(type="list", formula1='"Lembur Bersama,Libur Bersama"', allow_blank=True)
+    ws_kegiatan.add_data_validation(dv_jenis)
+    dv_jenis.add("D2:D500")
+
+    # 4. Petunjuk
+    guide = wb.create_sheet("Petunjuk")
+    guide.append(["PANDUAN TEMPLATE CUTI, LEMBUR & KEGIATAN BERSAMA"])
+    guide_rows = [
+        ["1. Sheet Cuti_Izin", "Digunakan untuk perizinan dan cuti individual per karyawan berdasarkan No. (Employee ID). Status 'Approved' akan membebaskan karyawan dari status Mangkir dan potongan mangkir."],
+        ["2. Sheet Lembur_Karyawan", "Digunakan untuk pencatatan lembur individual di luar jam kantor normal per karyawan berdasarkan No. (Employee ID). Durasi lembur otomatis diakumulasikan."],
+        ["3. Sheet Kegiatan_Bersama", "Berlaku global untuk seluruh karyawan (atau divisi terkait) tanpa memerlukan scan absensi fingerprint di kantor."],
+        ["   - Jenis 'Lembur Bersama'", "Contoh: Pameran launching di Mall / pameran otomotif. Seluruh karyawan yang bertugas TIDAK dianggap mangkir meskipun tidak ada scan di kantor, dan jam lembur akan ditambahkan."],
+        ["   - Jenis 'Libur Bersama'", "Contoh: Cuti bersama perusahaan atau libur khusus. Seluruh karyawan otomatis berstatus Libur Bersama dan tidak dianggap mangkir."],
+        ["Format Tanggal & Jam", "Gunakan format YYYY-MM-DD untuk tanggal (contoh: 2026-09-15) dan HH:MM untuk jam (contoh: 17:00)."],
+    ]
+    for row in guide_rows:
+        guide.append(row)
+
+    guide["A1"].font = Font(name="Segoe UI", size=13, bold=True, color=WHITE)
+    guide["A1"].fill = header_fill
+    guide.merge_cells("A1:B1")
+    for row in guide.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = body_font
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    guide.column_dimensions["A"].width = 28
+    guide.column_dimensions["B"].width = 85
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+# --------------------------------------------------------------------------
+# File Parser / Loader
+# --------------------------------------------------------------------------
+
+def load_leave_file(file_bytes: bytes, filename: str | None) -> LeaveLoadResult:
+    """Load leave/overtime/group-event data from .xlsx, .xls or .csv.
+
+    XLS is read with the Calamine engine and converted in-memory to an
+    openpyxl workbook so the existing multi-sheet leave parser can be reused.
+    CSV is treated as a single Cuti/Izin table.
+    """
+    ext = validate_extension(filename)
+
+    if ext == ".xlsx":
+        return load_leave_workbook(io.BytesIO(file_bytes))
+
+    sheets = read_workbook_sheets(file_bytes, filename)
+    if ext == ".csv":
+        df = sheets.get("Sheet1", pl.DataFrame())
+        return _load_leave_csv_dataframe(df)
+
+    # .xls: reconstruct a temporary XLSX workbook from all sheets.
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for sheet_name, df in sheets.items():
+        safe_name = str(sheet_name)[:31] or "Sheet1"
+        ws = wb.create_sheet(safe_name)
+        if df.columns:
+            ws.append(list(df.columns))
+            for row in df.rows():
+                ws.append(list(row))
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return load_leave_workbook(buffer)
+
+
+def _load_leave_csv_dataframe(df: pl.DataFrame) -> LeaveLoadResult:
+    """CSV leave input uses the same approved-leave normalization path."""
+    result = LeaveLoadResult()
+    if df.is_empty():
+        return result
+
+    # Convert the normalized CSV rows to LeaveRecord directly.
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    def col(*names: str):
+        for name in names:
+            if name.lower() in cols:
+                return cols[name.lower()]
+        return None
+
+    id_col = col("No.", "Employee ID", "ID", "NIK")
+    name_col = col("Nama", "Name")
+    start_col = col("Tanggal Mulai", "Mulai", "Start Date", "Tanggal")
+    end_col = col("Tanggal Selesai", "Selesai", "End Date")
+    type_col = col("Leave Type", "Type", "Jenis")
+    status_col = col("Status Approval", "Status")
+    note_col = col("Keterangan", "Note", "Catatan")
+
+    if not id_col or not start_col:
+        result.rejected.append(RejectedRow("CSV", 1, "CSV Cuti/Izin harus memiliki No. dan Tanggal Mulai/Tanggal.", {}))
+        return result
+
+    for idx, row in enumerate(df.rows(), start=2):
+        data = dict(zip(df.columns, row))
+        emp_id = data.get(id_col)
+        if emp_id is None or str(emp_id).strip() == "":
+            result.rejected.append(RejectedRow("CSV", idx, "No. (Employee ID) kosong", data))
+            continue
+        start_date = _to_date(data.get(start_col))
+        end_date = _to_date(data.get(end_col)) if end_col else start_date
+        if start_date is None:
+            result.rejected.append(RejectedRow("CSV", idx, "Tanggal Mulai tidak valid", data))
+            continue
+        status = ApprovalStatus.parse(data.get(status_col)) if status_col else ApprovalStatus.APPROVED
+        status = status or ApprovalStatus.APPROVED
+        if status is not ApprovalStatus.APPROVED:
+            result.rejected.append(RejectedRow("CSV", idx, f"Status '{status.value}' (Bukan Approved)", data))
+            continue
+        result.leaves.append(
+            LeaveRecord(
+                employee_id=str(emp_id).strip(),
+                name=str(data.get(name_col)).strip() if name_col and data.get(name_col) is not None else None,
+                start_date=start_date,
+                end_date=end_date or start_date,
+                leave_type=str(data.get(type_col)).strip() if type_col and data.get(type_col) is not None else "Cuti/Izin",
+                status=status,
+                note=str(data.get(note_col)).strip() if note_col and data.get(note_col) is not None else None,
+                source_row=idx,
+            )
+        )
+    return result
+
+
+def _find_sheet(wb: openpyxl.Workbook, aliases: list[str]) -> Optional[str]:
+    cleaned = {s.lower().replace(" ", "").replace("_", "").replace("/", ""): s for s in wb.sheetnames}
+    for alias in aliases:
+        key = alias.lower().replace(" ", "").replace("_", "").replace("/", "")
+        if key in cleaned:
+            return cleaned[key]
+    for alias in aliases:
+        key = alias.lower().replace(" ", "").replace("_", "").replace("/", "")
+        for k, orig in cleaned.items():
+            if key in k or k in key:
+                return orig
+    return None
+
+
+def load_leave_workbook(path: str | Path | object) -> LeaveLoadResult:
+    """Membaca file Excel Cuti, Lembur & Kegiatan Bersama dengan toleransi variasi nama sheet."""
+    if hasattr(path, "seek"):
+        path.seek(0)
+
+    result = LeaveLoadResult()
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+    except Exception as exc:
+        result.rejected.append(RejectedRow("Workbook", 1, f"File tidak dapat dibaca sebagai Excel: {exc}", {}))
+        return result
+
+    cuti_sheet = _find_sheet(wb, ["Cuti_Izin", "Cuti/Izin", "Cuti", "Data Cuti", "Izin", "Leave"])
+    lembur_sheet = _find_sheet(wb, ["Lembur_Karyawan", "Lembur Karyawan", "Lembur", "Overtime"])
+    kegiatan_sheet = _find_sheet(
+        wb,
+        [
+            "Kegiatan_Bersama",
+            "Kegiatan/Event/Lembur Bersama/Cuti Bersama",
+            "Kegiatan Bersama",
+            "Event",
+            "Kegiatan",
+            "Lembur Bersama",
+            "Cuti Bersama",
+        ],
+    )
+
+    # Fallback: if none matched by alias, check if active sheet is single-sheet cuti/leave table
+    if not cuti_sheet and not lembur_sheet and not kegiatan_sheet and wb.sheetnames:
+        first_ws = wb.active
+        first_row = [str(c).lower() for c in next(first_ws.iter_rows(min_row=1, max_row=1, values_only=True), []) if c]
+        if any("cuti" in c or "leave" in c or "tanggal" in c or "date" in c for c in first_row):
+            cuti_sheet = first_ws.title
+
+    if cuti_sheet and cuti_sheet in wb.sheetnames:
+        _load_cuti_izin(wb[cuti_sheet], result)
+    if lembur_sheet and lembur_sheet in wb.sheetnames:
+        _load_lembur_karyawan(wb[lembur_sheet], result)
+    if kegiatan_sheet and kegiatan_sheet in wb.sheetnames:
+        _load_kegiatan_bersama(wb[kegiatan_sheet], result)
+
+    return result
+
+
+def _load_cuti_izin(ws, result: LeaveLoadResult) -> None:
+    headers = [str(c).strip() if c else "" for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True), [])]
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if _row_is_blank(row):
+            continue
+        emp_id, name, start_raw, end_raw, _, leave_type, status_raw, note = _pad(row, 8)
+        raw = dict(zip(headers or ["No.", "Nama", "Mulai", "Selesai", "Jumlah", "Type", "Status", "Ket"], row))
+
+        if _is_blank(emp_id):
+            result.rejected.append(RejectedRow(ws.title, row_idx, "No. (Employee ID) kosong", raw))
+            continue
+
+        start_date = _to_date(start_raw)
+        end_date = _to_date(end_raw) or start_date
+        if start_date is None:
+            result.rejected.append(RejectedRow(ws.title, row_idx, "Tanggal Mulai tidak valid", raw))
+            continue
+
+        status = ApprovalStatus.parse(status_raw) or ApprovalStatus.APPROVED
+        if status is not ApprovalStatus.APPROVED:
+            result.rejected.append(RejectedRow(ws.title, row_idx, f"Status '{status.value}' (Bukan Approved)", raw))
+            continue
+
+        result.leaves.append(
+            LeaveRecord(
+                employee_id=str(emp_id).strip(),
+                name=str(name).strip() if not _is_blank(name) else None,
+                start_date=start_date,
+                end_date=end_date,
+                leave_type=str(leave_type).strip() if not _is_blank(leave_type) else "Cuti/Izin",
+                status=status,
+                note=str(note).strip() if not _is_blank(note) else None,
+                source_row=row_idx,
+            )
+        )
+
+
+def _load_lembur_karyawan(ws, result: LeaveLoadResult) -> None:
+    headers = [str(c).strip() if c else "" for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True), [])]
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if _row_is_blank(row):
+            continue
+        emp_id, name, date_raw, start_raw, end_raw, dur_raw, status_raw, note = _pad(row, 8)
+        raw = dict(zip(headers or ["No.", "Nama", "Tanggal", "Mulai", "Selesai", "Durasi", "Status", "Ket"], row))
+
+        if _is_blank(emp_id):
+            result.rejected.append(RejectedRow(ws.title, row_idx, "No. (Employee ID) kosong", raw))
+            continue
+
+        the_date = _to_date(date_raw)
+        start_time = _to_time(start_raw)
+        end_time = _to_time(end_raw)
+        if the_date is None:
+            result.rejected.append(RejectedRow(ws.title, row_idx, "Tanggal tidak valid", raw))
+            continue
+
+        # Parse duration
+        duration = 0.0
+        if dur_raw is not None and not _is_blank(dur_raw):
+            try:
+                duration = float(dur_raw)
+            except (ValueError, TypeError):
+                duration = 0.0
+
+        if duration <= 0.0 and start_time and end_time:
+            duration = _hours_between(start_time, end_time)
+
+        if duration <= 0.0:
+            duration = 1.0  # fallback 1 jam jika terisi
+
+        status = ApprovalStatus.parse(status_raw) or ApprovalStatus.APPROVED
+        if status is not ApprovalStatus.APPROVED:
+            result.rejected.append(RejectedRow(ws.title, row_idx, f"Status '{status.value}' (Bukan Approved)", raw))
+            continue
+
+        result.overtimes.append(
+            OvertimeRecord(
+                employee_id=str(emp_id).strip(),
+                name=str(name).strip() if not _is_blank(name) else None,
+                date=the_date,
+                start_time=start_time or dt.time(17, 0),
+                end_time=end_time or dt.time(20, 0),
+                duration_hours=round(duration, 2),
+                status=status,
+                note=str(note).strip() if not _is_blank(note) else None,
+                source_row=row_idx,
+            )
+        )
+
+
+def _load_kegiatan_bersama(ws, result: LeaveLoadResult) -> None:
+    headers = [str(c).strip() if c else "" for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True), [])]
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if _row_is_blank(row):
+            continue
+        start_raw, end_raw, name, jenis_raw, dur_raw, scope, note = _pad(row, 7)
+        raw = dict(zip(headers or ["Mulai", "Selesai", "Event", "Jenis", "Durasi", "Cakupan", "Ket"], row))
+
+        start_date = _to_date(start_raw)
+        end_date = _to_date(end_raw) or start_date
+        event_type = GroupEventType.parse(jenis_raw)
+
+        if start_date is None or event_type is None or _is_blank(name):
+            result.rejected.append(RejectedRow(ws.title, row_idx, "Data kegiatan tidak lengkap/valid", raw))
+            continue
+
+        duration_hours = 8.0 if event_type == GroupEventType.LEMBUR_BERSAMA else 0.0
+        if dur_raw is not None and not _is_blank(dur_raw):
+            try:
+                duration_hours = float(dur_raw)
+            except (ValueError, TypeError):
+                pass
+
+        result.group_events.append(
+            GroupEvent(
+                start_date=start_date,
+                end_date=end_date,
+                name=str(name).strip(),
+                event_type=event_type,
+                duration_hours=round(duration_hours, 2),
+                scope=str(scope).strip() if not _is_blank(scope) else "Semua Karyawan",
+                note=str(note).strip() if not _is_blank(note) else None,
+                source_row=row_idx,
+            )
+        )
+
+
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Enrichment Engine Integrator
+# --------------------------------------------------------------------------
+
+def _ensure_polars(df: object) -> pl.DataFrame:
+    if isinstance(df, pl.DataFrame):
+        return df
+    if hasattr(df, "to_dict"):
+        return pl.from_pandas(df)
+    if isinstance(df, list):
+        return pl.DataFrame(df)
+    return pl.DataFrame(df)
+
+
+def _to_time(val: object) -> Optional[dt.time]:
+    if val is None:
+        return None
+    if isinstance(val, dt.datetime):
+        return val.time()
+    if isinstance(val, dt.time):
+        return val
+    # Penanganan angka float desimal jam dari Excel (0.0 - 1.0)
+    if isinstance(val, (float, int)) and 0 <= val <= 1:
+        total_seconds = int(val * 86400)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        return dt.time(hours % 24, minutes)
+    s = str(val).strip().replace(".", ":")
+    if not s or s.lower() in ("nan", "none", "nat", "<null>"):
+        return None
+    parts = s.split(":")
+    if len(parts) >= 2:
+        try:
+            return dt.time(int(parts[0]), int(parts[1]))
+        except ValueError:
+            return None
+    return None
+
+
+def apply_leave_kegiatan(daily_input: pl.DataFrame | object, leave_result: LeaveLoadResult | None) -> pl.DataFrame:
+    """Integrate Cuti, Lembur, and Kegiatan Bersama into the daily attendance table.
+
+    Vectorized with Polars expressions (joins + ``when``/``then``) instead of
+    iterating the table row-by-row, so this matches the rest of the engine
+    (see ``attendance/engine.py``) and doesn't risk dtype drift from
+    reconstructing a schema-less ``pl.DataFrame`` out of Python dicts.
+
+    Priority per employee-day (mirrors the original row-by-row behavior
+    exactly -- each case is mutually exclusive, first match wins):
+        1. Libur Bersama (group holiday)
+        2. Approved individual leave (Cuti)
+        3. Lembur Bersama (group overtime event)
+    Individual overtime (Lembur_Karyawan, sheet-based) is independent of the
+    three cases above and always applied when present; a matching Lembur
+    Bersama event adds its hours on top of it.
+
+    Known limitation, preserved as-is from the original implementation:
+    group events are matched by date only. ``GroupEvent.scope`` is parsed
+    when the workbook is loaded but is not yet applied here to restrict an
+    event to specific departments/employees -- every event currently
+    applies to all employees on its date(s).
+    """
+    daily = _ensure_polars(daily_input)
+    if daily.is_empty() or leave_result is None:
+        return daily
+
+    id_col = "No." if "No." in daily.columns else "Employee_ID"
+    date_col = "Tanggal" if "Tanggal" in daily.columns else "Date"
+
+    # These columns are only ever produced by this function -- make sure
+    # they exist (with a stable dtype) before joins/expressions reference them.
+    for col, default, dtype in (
+        ("Group_Event", "", pl.String),
+        ("Leave_Type", "", pl.String),
+        ("Overtime_Hours", 0.0, pl.Float64),
+        ("Overtime_Status", "", pl.String),
+    ):
+        if col not in daily.columns:
+            daily = daily.with_columns(pl.lit(default, dtype=dtype).alias(col))
+
+    # ---- Build small lookup frames from the (few) leave/overtime/event
+    # records, then join them onto the (many) employee x date rows. This
+    # keeps the row-count-heavy work vectorized while the lookup-building
+    # itself stays as plain Python over a small list, same as before.
+
+    # Individual overtime: sum duration per (employee, date).
+    if leave_result.overtimes:
+        ot_records = [
+            {"_emp": str(ot.employee_id).strip(), "_date": ot.date, "_hours": float(ot.duration_hours)}
+            for ot in leave_result.overtimes
+        ]
+        ot_df = (
+            pl.DataFrame(ot_records, schema={"_emp": pl.String, "_date": pl.Date, "_hours": pl.Float64})
+            .group_by(["_emp", "_date"])
+            .agg(pl.col("_hours").sum().alias("_ind_ot_hours"))
+        )
+    else:
+        ot_df = pl.DataFrame(schema={"_emp": pl.String, "_date": pl.Date, "_ind_ot_hours": pl.Float64})
+
+    # Approved individual leave: last record wins per (employee, date),
+    # same as the original dict-comprehension semantics.
+    leave_pairs: dict[tuple[str, dt.date], str] = {}
+    for lr in leave_result.leaves:
+        emp = str(lr.employee_id).strip()
+        for d in lr.dates():
+            leave_pairs[(emp, d)] = lr.leave_type
+    leave_df = pl.DataFrame(
+        [{"_emp": emp, "_date": d, "_leave_type": lt} for (emp, d), lt in leave_pairs.items()],
+        schema={"_emp": pl.String, "_date": pl.Date, "_leave_type": pl.String},
+    )
+
+    # Group events: last event wins per date, split by type (same as before).
+    holiday_by_date: dict[dt.date, GroupEvent] = {}
+    overtime_event_by_date: dict[dt.date, GroupEvent] = {}
+    for ev in leave_result.group_events:
+        target = holiday_by_date if ev.event_type == GroupEventType.LIBUR_BERSAMA else overtime_event_by_date
+        for d in ev.dates():
+            target[d] = ev
+    holiday_df = pl.DataFrame(
+        [{"_date": d, "_holiday_name": ev.name} for d, ev in holiday_by_date.items()],
+        schema={"_date": pl.Date, "_holiday_name": pl.String},
+    )
+    overtime_event_df = pl.DataFrame(
+        [
+            {"_date": d, "_event_name": ev.name, "_event_hours": float(ev.duration_hours or 8.0)}
+            for d, ev in overtime_event_by_date.items()
+        ],
+        schema={"_date": pl.Date, "_event_name": pl.String, "_event_hours": pl.Float64},
+    )
+
+    # Join key: employee id, trimmed the same way the original lookup keys were.
+    daily = daily.with_columns(pl.col(id_col).cast(pl.String).str.strip_chars().alias("_join_emp"))
+    daily = daily.join(ot_df, left_on=["_join_emp", date_col], right_on=["_emp", "_date"], how="left")
+    daily = daily.join(leave_df, left_on=["_join_emp", date_col], right_on=["_emp", "_date"], how="left")
+    daily = daily.join(holiday_df, left_on=date_col, right_on="_date", how="left")
+    daily = daily.join(overtime_event_df, left_on=date_col, right_on="_date", how="left")
+
+    is_holiday_case = pl.col("_holiday_name").is_not_null()
+    is_leave_case = (~is_holiday_case) & pl.col("_leave_type").is_not_null()
+    is_overtime_event_case = (~is_holiday_case) & (~is_leave_case) & pl.col("_event_name").is_not_null()
+    has_individual_ot = pl.col("_ind_ot_hours").is_not_null()
+    no_scan = pl.col("Scan_Count").fill_null(0) == 0
+    any_case_no_scan = (is_holiday_case | is_leave_case | is_overtime_event_case) & no_scan
+
+    ind_ot = pl.col("_ind_ot_hours").fill_null(0.0).round(2)
+    event_hours = pl.col("_event_hours").fill_null(0.0)
+
+    daily = daily.with_columns(
+        Group_Event=pl.when(is_holiday_case)
+        .then(pl.col("_holiday_name"))
+        .when(is_overtime_event_case)
+        .then(pl.col("_event_name"))
+        .otherwise(pl.col("Group_Event")),
+        Leave_Type=pl.when(is_leave_case).then(pl.col("_leave_type")).otherwise(pl.col("Leave_Type")),
+        Overtime_Hours=pl.when(is_overtime_event_case).then((ind_ot + event_hours).round(2)).otherwise(ind_ot),
+        Overtime_Status=pl.when(has_individual_ot | is_overtime_event_case)
+        .then(pl.lit("Approved"))
+        .otherwise(pl.col("Overtime_Status")),
+    )
+
+    daily = daily.with_columns(
+        Absent_Flag=pl.when(is_holiday_case | is_leave_case | (is_overtime_event_case & no_scan))
+        .then(pl.lit(0, dtype=pl.Int64))
+        .otherwise(pl.col("Absent_Flag")),
+        Is_Working_Day=pl.when(is_holiday_case).then(pl.lit(False)).otherwise(pl.col("Is_Working_Day")),
+        Work_Day_Flag=pl.when(is_holiday_case)
+        .then(pl.lit(0, dtype=pl.Int64))
+        .otherwise(pl.col("Work_Day_Flag")),
+        Present_Flag=pl.when(is_leave_case | (is_overtime_event_case & no_scan))
+        .then(pl.lit(1, dtype=pl.Int64))
+        .otherwise(pl.col("Present_Flag")),
+    )
+
+    daily = daily.with_columns(
+        Status_Masuk=pl.when(is_holiday_case & no_scan)
+        .then(pl.lit("Libur Bersama"))
+        .when(is_leave_case & no_scan)
+        .then(pl.lit("Cuti Disetujui"))
+        .when(is_overtime_event_case & no_scan)
+        .then(pl.lit("Lembur Bersama"))
+        .otherwise(pl.col("Status_Masuk")),
+        Status_Pulang=pl.when(is_holiday_case & no_scan)
+        .then(pl.lit("Libur Bersama"))
+        .when(is_leave_case & no_scan)
+        .then(pl.col("_leave_type"))
+        .when(is_overtime_event_case & no_scan)
+        .then(pl.lit("Lembur Bersama"))
+        .otherwise(pl.col("Status_Pulang")),
+        Menit_Telat=pl.when(any_case_no_scan).then(pl.lit(0, dtype=pl.Int64)).otherwise(pl.col("Menit_Telat")),
+        Menit_Pulang_Cepat=pl.when(any_case_no_scan)
+        .then(pl.lit(0, dtype=pl.Int64))
+        .otherwise(pl.col("Menit_Pulang_Cepat")),
+        Is_Anomali=pl.when(any_case_no_scan).then(pl.lit(0, dtype=pl.Int64)).otherwise(pl.col("Is_Anomali")),
+        Late_Flag=pl.when((is_holiday_case | is_leave_case) & no_scan)
+        .then(pl.lit(0, dtype=pl.Int64))
+        .otherwise(pl.col("Late_Flag")),
+        Early_Leave_Flag=pl.when((is_holiday_case | is_leave_case) & no_scan)
+        .then(pl.lit(0, dtype=pl.Int64))
+        .otherwise(pl.col("Early_Leave_Flag")),
+    )
+
+    return daily.drop(
+        ["_join_emp", "_ind_ot_hours", "_leave_type", "_holiday_name", "_event_name", "_event_hours"]
+    )
+
+
+
+# --------------------------------------------------------------------------
+# Helper Functions
+# --------------------------------------------------------------------------
+
+def _pad(row: tuple, length: int) -> tuple:
+    return row[:length] if len(row) >= length else row + (None,) * (length - len(row))
+
+def _is_blank(val: object) -> bool:
+    return val is None or (isinstance(val, str) and val.strip() == "")
+
+def _row_is_blank(row: tuple) -> bool:
+    return all(_is_blank(v) for v in row)
+
+def _to_date(val: object) -> Optional[dt.date]:
+    if val is None:
+        return None
+    if isinstance(val, dt.datetime):
+        return val.date()
+    if isinstance(val, dt.date):
+        return val
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "nat", "<null>"):
+        return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return dt.datetime.strptime(s[:10], fmt).date()
+        except ValueError:
+            pass
+    return None
+
+def _hours_between(start: dt.time, end: dt.time) -> float:
+    s = start.hour + start.minute / 60.0
+    e = end.hour + end.minute / 60.0
+    return e - s if e >= s else (e + 24) - s
+
+def _date_range(start: dt.date, end: dt.date) -> list[dt.date]:
+    return [start + dt.timedelta(days=i) for i in range((end - start).days + 1)]
+</file>
+
+<file path="src/application/payroll.py">
+"""
+Payroll deduction and payslip data engine (Section 7).
+
+The engine only ever computes a monetary deduction when HR has explicitly
+supplied the corresponding rate in ``PayrollConfig``. When a rate is
+missing, the column is left as ``None`` / null (rendered as "Belum Diatur" in the
+Excel export) instead of silently defaulting to zero or to an invented
+number — the spec is explicit that HR-defined nominal values must never be
+assumed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import polars as pl
+
+from .config import PayrollConfig
+
+PAYROLL_COLUMNS = [
+    "No.",
+    "Name",
+    "Department",
+    "Employee_Type",
+    "Monthly_Salary",
+    "Jumlah_Terlambat",
+    "Total_Menit_Telat",
+    "Jumlah_Pulang_Cepat",
+    "Total_Menit_Pulang_Cepat",
+    "Jumlah_Mangkir",
+    "Jumlah_Tidak_Absen_Pulang",
+    "Potongan_Telat",
+    "Potongan_Pulang_Cepat",
+    "Potongan_Mangkir",
+    "Potongan_Lupa_Pulang_Sales",
+    "Potongan_Lain",
+    "Total_Potongan",
+    "Estimasi_Take_Home",
+]
+
+
+@dataclass
+class PayslipData:
+    """Complete employee payslip record for PDF and Excel rendering."""
+    # Employee Identity
+    employee_id: str
+    name: str
+    department: str
+    position: str = "Staff"
+    employee_type: str = "OFFICE"
+    period_label: str = ""
+    join_date: str = "-"
+
+    # Earnings (Pendapatan)
+    gaji_pokok: float = 0.0
+    lembur_hours: float = 0.0
+    lembur_pay: float = 0.0
+    tunjangan_jabatan: float = 0.0
+    uang_makan: float = 0.0
+    tunjangan_transport: float = 0.0
+    tunjangan_lain: float = 0.0
+    total_pendapatan: float = 0.0
+
+    # Deductions (Potongan)
+    potongan_mangkir: float = 0.0
+    potongan_telat: float = 0.0
+    potongan_pulang_cepat: float = 0.0
+    potongan_lupa_pulang_sales: float = 0.0
+    potongan_bpjs_kesehatan: float = 0.0
+    potongan_bpjs_tk_jht: float = 0.0
+    potongan_bpjs_tk_jp: float = 0.0
+    potongan_pph21: float = 0.0
+    potongan_lain: float = 0.0
+    total_potongan: float = 0.0
+
+    # Net Pay
+    take_home_pay: float = 0.0
+
+    # Attendance Summary (Rangkuman Informasi Kehadiran)
+    hari_kehadiran: int = 0
+    hari_mangkir: int = 0
+    hari_cuti: int = 0
+    hari_izin: int = 0
+    hari_sakit: int = 0
+    kali_terlambat: int = 0
+    menit_terlambat: int = 0
+    kali_pulang_cepat: int = 0
+    kali_lupa_absen: int = 0
+    total_jam_lembur: float = 0.0
+
+
+def calculate_payroll(
+    employee_summary: pl.DataFrame,
+    master: Optional[pl.DataFrame],
+    cfg: PayrollConfig,
+) -> pl.DataFrame:
+    """Calculate payroll deductions and estimated take-home pay."""
+    if employee_summary.is_empty():
+        schema = {c: pl.String if c in ("No.", "Name", "Department", "Employee_Type") else pl.Float64 for c in PAYROLL_COLUMNS}
+        return pl.DataFrame(schema=schema)
+
+    df_summary = employee_summary
+    cols_needed = [
+        "No.", "Name", "Department", "Employee_Type",
+        "Terlambat", "Total_Menit_Telat",
+        "Pulang_Cepat", "Total_Menit_Pulang_Cepat", "Mangkir",
+    ]
+    present_cols = [c for c in cols_needed if c in df_summary.columns]
+    df = df_summary.select(present_cols)
+
+    rename_map = {
+        "Terlambat": "Jumlah_Terlambat",
+        "Pulang_Cepat": "Jumlah_Pulang_Cepat",
+        "Mangkir": "Jumlah_Mangkir",
+    }
+    df = df.rename({k: v for k, v in rename_map.items() if k in df.columns})
+
+    for col in ["Jumlah_Terlambat", "Total_Menit_Telat", "Jumlah_Pulang_Cepat", "Total_Menit_Pulang_Cepat", "Jumlah_Mangkir"]:
+        if col not in df.columns:
+            df = df.with_columns(pl.lit(0, dtype=pl.Int64).alias(col))
+        else:
+            df = df.with_columns(pl.col(col).cast(pl.Int64))
+
+    if "Tidak_Absen_Pulang" in df_summary.columns:
+        df = df.with_columns(Jumlah_Tidak_Absen_Pulang=df_summary["Tidak_Absen_Pulang"].cast(pl.Int64))
+    else:
+        df = df.with_columns(Jumlah_Tidak_Absen_Pulang=pl.lit(0, dtype=pl.Int64))
+
+    if master is not None and not master.is_empty() and "No." in master.columns and "Monthly_Salary" in master.columns:
+        salary_sub = master.select(["No.", "Monthly_Salary"]).unique(subset=["No."])
+        df = df.join(salary_sub, on="No.", how="left")
+        df = df.with_columns(Monthly_Salary=pl.col("Monthly_Salary").cast(pl.Float64))
+    else:
+        df = df.with_columns(Monthly_Salary=pl.lit(None, dtype=pl.Float64))
+
+    # 1. Potongan Keterlambatan: per_occurrence vs per_minute
+    if cfg.late_deduction_mode == "per_occurrence":
+        active_late_rate = cfg.late_deduction_per_occurrence
+        if active_late_rate is not None:
+            df = df.with_columns(
+                Potongan_Telat=(pl.col("Jumlah_Terlambat").cast(pl.Float64) * active_late_rate).round(0)
+            )
+        else:
+            df = df.with_columns(Potongan_Telat=pl.lit(None, dtype=pl.Float64))
+    else:
+        active_late_rate = cfg.late_deduction_per_minute
+        if active_late_rate is not None:
+            df = df.with_columns(
+                Potongan_Telat=(pl.col("Total_Menit_Telat").cast(pl.Float64) * active_late_rate).round(0)
+            )
+        else:
+            df = df.with_columns(Potongan_Telat=pl.lit(None, dtype=pl.Float64))
+
+    # 2. Potongan Pulang Cepat
+    if cfg.early_leave_deduction_per_minute is not None:
+        df = df.with_columns(
+            Potongan_Pulang_Cepat=(
+                pl.col("Total_Menit_Pulang_Cepat").cast(pl.Float64) * cfg.early_leave_deduction_per_minute
+            ).round(0)
+        )
+    else:
+        df = df.with_columns(Potongan_Pulang_Cepat=pl.lit(None, dtype=pl.Float64))
+
+    # 3. Potongan Mangkir
+    if cfg.absence_deduction_per_day is not None:
+        df = df.with_columns(
+            Potongan_Mangkir=(
+                pl.col("Jumlah_Mangkir").cast(pl.Float64) * cfg.absence_deduction_per_day
+            ).round(0)
+        )
+    else:
+        df = df.with_columns(Potongan_Mangkir=pl.lit(None, dtype=pl.Float64))
+
+    # 4. Potongan Khusus Tim Sales: per 1x tidak absen pulang
+    if cfg.sales_no_clock_out_deduction is not None:
+        df = df.with_columns(
+            Potongan_Lupa_Pulang_Sales=pl.when(
+                pl.col("Employee_Type").cast(pl.String).str.to_uppercase() == "SALES"
+            )
+            .then(
+                (pl.col("Jumlah_Tidak_Absen_Pulang").cast(pl.Float64) * cfg.sales_no_clock_out_deduction).round(0)
+            )
+            .otherwise(0.0)
+        )
+    else:
+        df = df.with_columns(Potongan_Lupa_Pulang_Sales=pl.lit(None, dtype=pl.Float64))
+
+    # 5. Potongan Lain (Manual)
+    df = df.with_columns(Potongan_Lain=pl.lit(None, dtype=pl.Float64))
+
+    # 6. Total Potongan
+    configured_rates = [
+        ("Potongan_Telat", active_late_rate),
+        ("Potongan_Pulang_Cepat", cfg.early_leave_deduction_per_minute),
+        ("Potongan_Mangkir", cfg.absence_deduction_per_day),
+        ("Potongan_Lupa_Pulang_Sales", cfg.sales_no_clock_out_deduction),
+    ]
+    active_cols = [col for col, rate in configured_rates if rate is not None]
+
+    if active_cols:
+        sum_expr = pl.sum_horizontal([pl.col(c).fill_null(0.0) for c in active_cols])
+        df = df.with_columns(Total_Potongan=sum_expr)
+    else:
+        df = df.with_columns(Total_Potongan=pl.lit(None, dtype=pl.Float64))
+
+    # 7. Estimasi Take Home
+    df = df.with_columns(
+        Estimasi_Take_Home=pl.when(pl.col("Monthly_Salary").is_not_null())
+        .then(pl.col("Monthly_Salary") - pl.col("Total_Potongan").fill_null(0.0))
+        .otherwise(None)
+    )
+
+    return df.select(PAYROLL_COLUMNS).sort(["Department", "Name"])
+
+
+def build_payslip_records(
+    payroll_df: pl.DataFrame,
+    employee_summary_df: pl.DataFrame,
+    daily_df: pl.DataFrame,
+    master_df: Optional[pl.DataFrame] = None,
+    overtime_hourly_rate: float = 0.0,
+    period_label: str = "",
+) -> list[PayslipData]:
+    """Compile structured PayslipData objects for each employee."""
+    if payroll_df.is_empty():
+        return []
+
+    # Map positions and join dates from master if present
+    pos_map = {}
+    join_map = {}
+    if master_df is not None and not master_df.is_empty():
+        for r in master_df.iter_rows(named=True):
+            eid = str(r.get("No.", "")).strip()
+            if eid:
+                if "Position" in r and r["Position"]:
+                    pos_map[eid] = str(r["Position"])
+                if "Join_Date" in r and r["Join_Date"]:
+                    join_map[eid] = str(r["Join_Date"])
+
+    # Leave breakdown from daily attendance
+    leave_breakdown = {}
+    if not daily_df.is_empty() and "No." in daily_df.columns:
+        for r in daily_df.iter_rows(named=True):
+            eid = str(r.get("No.", "")).strip()
+            if eid not in leave_breakdown:
+                leave_breakdown[eid] = {"cuti": 0, "izin": 0, "sakit": 0}
+            
+            # Check leave status
+            sm = str(r.get("Status_Masuk", "")).lower()
+            sp = str(r.get("Status_Pulang", "")).lower()
+            lt = str(r.get("Leave_Type", "")).lower()
+            text_check = f"{sm} {sp} {lt}"
+            if "sakit" in text_check:
+                leave_breakdown[eid]["sakit"] += 1
+            elif "cuti" in text_check:
+                leave_breakdown[eid]["cuti"] += 1
+            elif "izin" in text_check or "ijin" in text_check or "dispensasi" in text_check:
+                leave_breakdown[eid]["izin"] += 1
+
+    summary_map = {}
+    if not employee_summary_df.is_empty():
+        for r in employee_summary_df.iter_rows(named=True):
+            eid = str(r.get("No.", "")).strip()
+            if eid:
+                summary_map[eid] = r
+
+    payslips = []
+    for r in payroll_df.iter_rows(named=True):
+        eid = str(r.get("No.", "")).strip()
+        name = str(r.get("Name", ""))
+        dept = str(r.get("Department", ""))
+        etype = str(r.get("Employee_Type", "OFFICE"))
+
+        summ = summary_map.get(eid, {})
+        leaves = leave_breakdown.get(eid, {"cuti": 0, "izin": 0, "sakit": 0})
+
+        # Earnings
+        salary = float(r.get("Monthly_Salary") or 0.0)
+        overtime_hrs = float(summ.get("Total_Jam_Lembur") or 0.0)
+        overtime_pay = overtime_hrs * overtime_hourly_rate if overtime_hourly_rate > 0 else 0.0
+        total_income = salary + overtime_pay
+
+        # Deductions
+        # Di dalam build_payslip_records (src/application/payroll.py)
+        # Tangani nilai None dengan tepat untuk pelaporan
+        pot_mangkir = float(r.get("Potongan_Mangkir") or 0.0) if r.get("Potongan_Mangkir") is not None else 0.0
+        pot_telat = float(r.get("Potongan_Telat") or 0.0) if r.get("Potongan_Telat") is not None else 0.0
+        pot_pulang_cepat = float(r.get("Potongan_Pulang_Cepat") or 0.0) if r.get("Potongan_Pulang_Cepat") is not None else 0.0
+        pot_sales = float(r.get("Potongan_Lupa_Pulang_Sales") or 0.0) if r.get("Potongan_Lupa_Pulang_Sales") is not None else 0.0
+        pot_lain = float(r.get("Potongan_Lain") or 0.0)
+        total_pot = pot_mangkir + pot_telat + pot_pulang_cepat + pot_sales + pot_lain
+        net_pay = max(0.0, total_income - total_pot)
+
+        slip = PayslipData(
+            employee_id=eid,
+            name=name,
+            department=dept,
+            position=pos_map.get(eid, "Staff"),
+            employee_type=etype,
+            period_label=period_label,
+            join_date=join_map.get(eid, "-"),
+            # Earnings
+            gaji_pokok=salary,
+            lembur_hours=overtime_hrs,
+            lembur_pay=overtime_pay,
+            total_pendapatan=total_income,
+            # Deductions
+            potongan_mangkir=pot_mangkir,
+            potongan_telat=pot_telat,
+            potongan_pulang_cepat=pot_pulang_cepat,
+            potongan_lupa_pulang_sales=pot_sales,
+            potongan_lain=pot_lain,
+            total_potongan=total_pot,
+            take_home_pay=net_pay,
+            # Attendance
+            hari_kehadiran=int(summ.get("Hadir") or 0),
+            hari_mangkir=int(summ.get("Mangkir") or 0),
+            hari_cuti=leaves["cuti"],
+            hari_izin=leaves["izin"],
+            hari_sakit=leaves["sakit"],
+            kali_terlambat=int(summ.get("Terlambat") or 0),
+            menit_terlambat=int(summ.get("Total_Menit_Telat") or 0),
+            kali_pulang_cepat=int(summ.get("Pulang_Cepat") or 0),
+            kali_lupa_absen=int(summ.get("Lupa_Absen") or 0),
+            total_jam_lembur=overtime_hrs,
+        )
+        payslips.append(slip)
+
+    return payslips
+</file>
+
+<file path="src/application/sales.py">
+"""
+Sales performance module (Section 4).
+
+Sales performance is deliberately kept as a *separate* data source and
+pipeline from attendance. Nothing here reads scan counts, first/last scan
+times, or any other fingerprint-derived value — canvassing is not observable
+on the attendance machine (Section 3) and this module never pretends it is.
+"""
+
+from __future__ import annotations
+
+import io
+from typing import Optional
+
+import polars as pl
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+from .config import SalesScoreConfig
+from attendance.parser import parse_datetime_expr
+
+SALES_ACTIVITY_COLUMNS = ["No.", "Tanggal", "Prospect", "Visit", "Test_Drive", "SPK", "Delivery", "Revenue"]
+
+SALES_PERFORMANCE_COLUMNS = [
+    "No.", "Name", "Department",
+    "Prospect", "Visit", "Test_Drive", "SPK", "Delivery", "Revenue",
+    "Conversion_Rate_%", "Performance_Score", "Performance_Classification",
+]
+
+NAVY = "1F4E78"
+WHITE = "FFFFFF"
+
+
+class SalesActivityError(ValueError):
+    pass
+
+
+def _clean_col(name: object) -> str:
+    return str(name).replace("\n", " ").strip()
+
+
+def clean_sales_activity(raw_input: Optional[pl.DataFrame]) -> pl.DataFrame:
+    """Validate and normalize an uploaded Sales Activity file.
+
+    Required columns: employee ID and date. All KPI columns are optional
+    and default to 0 when absent, since a sales rep may have zero of a
+    given activity on a given day — that is data, not a missing value.
+    """
+    if raw_input is None or raw_input.is_empty():
+        return pl.DataFrame(
+            schema={
+                "No.": pl.String,
+                "Tanggal": pl.Date,
+                "Prospect": pl.Float64,
+                "Visit": pl.Float64,
+                "Test_Drive": pl.Float64,
+                "SPK": pl.Float64,
+                "Delivery": pl.Float64,
+                "Revenue": pl.Float64,
+            }
+        )
+
+    df = raw_input
+    rename_map = {c: _clean_col(c) for c in df.columns}
+    df = df.rename(rename_map)
+
+    id_col = next((c for c in ["No.", "Employee ID", "ID", "NIK"] if c in df.columns), None)
+    date_col = next((c for c in ["Tanggal", "Date"] if c in df.columns), None)
+    if not id_col or not date_col:
+        raise SalesActivityError(
+            "File Sales Activity harus memiliki kolom employee ID (No./Employee ID) "
+            "dan tanggal (Tanggal/Date)."
+        )
+
+    kpi_map = {
+        "Prospect": ["Prospect", "Prospek"],
+        "Visit": ["Visit", "Customer Visit"],
+        "Test_Drive": ["Test Drive", "Test_Drive"],
+        "SPK": ["SPK"],
+        "Delivery": ["Delivery"],
+        "Revenue": ["Revenue"],
+    }
+
+    select_exprs = [
+        pl.col(id_col).cast(pl.String).str.strip_chars().alias("No."),
+        parse_datetime_expr(date_col).dt.date().alias("Tanggal"),
+    ]
+
+    for target, candidates in kpi_map.items():
+        matched = next((c for c in candidates if c in df.columns), None)
+        if matched:
+            select_exprs.append(pl.col(matched).cast(pl.Float64, strict=False).fill_null(0.0).alias(target))
+        else:
+            select_exprs.append(pl.lit(0.0, dtype=pl.Float64).alias(target))
+
+    out = df.select(select_exprs)
+    out = out.filter(pl.col("No.").is_not_null() & (pl.col("No.") != "") & pl.col("Tanggal").is_not_null())
+    return out.select(SALES_ACTIVITY_COLUMNS)
+
+
+def _normalize_series(s: pl.Series) -> list[float]:
+    vals = s.to_list()
+    valid_vals = [v for v in vals if v is not None]
+    if not valid_vals:
+        return [0.0] * len(vals)
+    lo = min(valid_vals)
+    hi = max(valid_vals)
+    if hi == lo:
+        return [100.0 if (v is not None and v > 0) else 0.0 for v in vals]
+    return [round((v - lo) / (hi - lo) * 100.0, 4) if v is not None else 0.0 for v in vals]
+
+
+def calculate_sales_performance(
+    sales_activity: Optional[pl.DataFrame],
+    master: Optional[pl.DataFrame],
+    cfg: SalesScoreConfig,
+) -> pl.DataFrame:
+    """Aggregate Sales Activity into per-employee sales KPIs (Section 4).
+
+    Performance_Score blends KPI volume (Visit/Test Drive/SPK/Delivery) and
+    Conversion Rate using HR-configurable weights (``SalesScoreConfig``),
+    each metric relatively normalised (0-100) across the current sales team
+    for the selected period, since no fixed company-wide sales target was
+    supplied.
+    """
+    if sales_activity is None or sales_activity.is_empty():
+        return pl.DataFrame(
+            schema={
+                "No.": pl.String,
+                "Name": pl.String,
+                "Department": pl.String,
+                "Prospect": pl.Float64,
+                "Visit": pl.Float64,
+                "Test_Drive": pl.Float64,
+                "SPK": pl.Float64,
+                "Delivery": pl.Float64,
+                "Revenue": pl.Float64,
+                "Conversion_Rate_%": pl.Float64,
+                "Performance_Score": pl.Float64,
+                "Performance_Classification": pl.String,
+            }
+        )
+
+    agg = sales_activity.group_by("No.", maintain_order=True).agg(
+        Prospect=pl.col("Prospect").cast(pl.Float64).sum(),
+        Visit=pl.col("Visit").cast(pl.Float64).sum(),
+        Test_Drive=pl.col("Test_Drive").cast(pl.Float64).sum(),
+        SPK=pl.col("SPK").cast(pl.Float64).sum(),
+        Delivery=pl.col("Delivery").cast(pl.Float64).sum(),
+        Revenue=pl.col("Revenue").cast(pl.Float64).sum(),
+    )
+
+    agg = agg.with_columns(
+        **{
+            "Conversion_Rate_%": pl.when(pl.col("Prospect") > 0)
+            .then(pl.col("SPK") / pl.col("Prospect") * 100.0)
+            .otherwise(0.0)
+        }
+    )
+
+    if master is not None and not master.is_empty() and "No." in master.columns:
+        m_sub = master.select(
+            [c for c in ["No.", "Name", "Department"] if c in master.columns]
+        ).unique(subset=["No."])
+        agg = agg.join(m_sub, on="No.", how="left")
+        agg = agg.with_columns(
+            Name=pl.when(pl.col("Name").is_not_null() & (pl.col("Name") != ""))
+            .then(pl.col("Name"))
+            .otherwise(pl.concat_str([pl.lit("Sales "), pl.col("No.")])),
+            Department=pl.col("Department").fill_null("Belum Dipetakan"),
+        )
+    else:
+        agg = agg.with_columns(
+            Name=pl.concat_str([pl.lit("Sales "), pl.col("No.")]),
+            Department=pl.lit("Belum Dipetakan", dtype=pl.String),
+        )
+
+    weights = {
+        "Visit": cfg.weight_visit,
+        "Test_Drive": cfg.weight_test_drive,
+        "SPK": cfg.weight_spk,
+        "Delivery": cfg.weight_delivery,
+        "Conversion_Rate_%": cfg.weight_conversion_rate,
+    }
+    total_weight = sum(weights.values()) or 1.0
+
+    scores = [0.0] * len(agg)
+    for col, w in weights.items():
+        norm_list = _normalize_series(agg[col])
+        factor = w / total_weight
+        for i, val in enumerate(norm_list):
+            scores[i] += val * factor
+
+    scores = [round(s, 1) for s in scores]
+    classifications = [cfg.classify(s) for s in scores]
+
+    agg = agg.with_columns(
+        Performance_Score=pl.Series("Performance_Score", scores, dtype=pl.Float64),
+        Performance_Classification=pl.Series("Performance_Classification", classifications, dtype=pl.String),
+    )
+
+    return agg.select(SALES_PERFORMANCE_COLUMNS).sort("Performance_Score", descending=True)
+
+
+def combine_attendance_and_sales(
+    employee_summary: Optional[pl.DataFrame], sales_performance: Optional[pl.DataFrame]
+) -> pl.DataFrame:
+    """Management view (Section 4 example table): attendance discipline
+    next to sales outcomes, joined on Employee ID only — the two data
+    sources are never blended at the raw-data level.
+    """
+    if employee_summary is None or employee_summary.is_empty() or sales_performance is None or sales_performance.is_empty():
+        return pl.DataFrame()
+
+    df_summary = employee_summary
+    df_sales = sales_performance
+
+    att_cols = [
+        "No.", "Name", "Department", "Attendance_Rate_%", "Terlambat", "Attendance_Score", "HR_Classification"
+    ]
+    avail_att = [c for c in att_cols if c in df_summary.columns]
+    att = df_summary.select(avail_att)
+
+    att_renamed = att.rename({c: f"{c}_att" for c in avail_att if c != "No."})
+    combined = df_sales.join(att_renamed, on="No.", how="left")
+
+    if "Name_att" in combined.columns:
+        combined = combined.with_columns(
+            Name=pl.coalesce([pl.col("Name"), pl.col("Name_att")])
+        ).drop("Name_att")
+
+    if "Department_att" in combined.columns:
+        combined = combined.with_columns(
+            Department=pl.coalesce([pl.col("Department"), pl.col("Department_att")])
+        ).drop("Department_att")
+
+    return combined
+
+
+def build_sales_activity_template() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sales Activity"
+    guide = wb.create_sheet("Petunjuk")
+
+    ws.append(["No.", "Tanggal", "Prospect", "Visit", "Test Drive", "SPK", "Delivery", "Revenue"])
+    ws.append(["EMP001", "2026-09-01", 8, 4, 2, 1, 0, 0])
+    ws.append(["EMP001", "2026-09-02", 6, 3, 1, 1, 1, 250000000])
+
+    header_fill = PatternFill("solid", fgColor=NAVY)
+    header_font = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
+    body_font = Font(name="Segoe UI", size=10, color="1F2937")
+    thin = Side(style="thin", color="D1D5DB")
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = Border(bottom=thin)
+    for row in ws.iter_rows(min_row=2, max_row=1000, max_col=8):
+        for cell in row:
+            cell.font = body_font
+            cell.border = Border(bottom=thin)
+    ws["B2"].number_format = "yyyy-mm-dd"
+    ws["B3"].number_format = "yyyy-mm-dd"
+
+    widths = {"A": 12, "B": 14, "C": 10, "D": 10, "E": 12, "F": 8, "G": 10, "H": 14}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = "A1:H1000"
+
+    guide_rows = [
+        ["PETUNJUK SALES ACTIVITY"],
+        ["Tujuan", "Mencatat aktivitas sales harian, TERPISAH dari data absensi fingerprint."],
+        ["No.", "Employee ID sales, harus sama dengan No. pada Employee Master / mesin absensi."],
+        ["Tanggal", "Tanggal aktivitas."],
+        ["Prospect / Visit / Test Drive / SPK / Delivery", "Jumlah kejadian pada tanggal tersebut."],
+        ["Revenue", "Nilai revenue dari delivery pada tanggal tersebut (opsional)."],
+        ["Catatan", "Canvassing TIDAK tercatat pada mesin absensi. Data ini adalah satu-satunya sumber untuk menilai performa sales."],
+    ]
+    for row in guide_rows:
+        guide.append(row)
+    guide["A1"].font = Font(name="Segoe UI", size=14, bold=True, color=WHITE)
+    guide["A1"].fill = header_fill
+    guide.merge_cells("A1:B1")
+    for row in guide.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = body_font
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    guide.column_dimensions["A"].width = 20
+    guide.column_dimensions["B"].width = 90
+
+    output = io.BytesIO()
+    wb.save(output)
+    return output.getvalue()
+</file>
+
+<file path="src/attendance/__init__.py">
+"""Attendance ingestion, calculation engine and analytics."""
+</file>
+
+<file path="src/attendance/analytics.py">
+"""Attendance analytics: employee KPIs, department roll-up, daily trend."""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import polars as pl
+
+from application.config import ScoreConfig
+
+
+def calculate_employee_summary(daily: pl.DataFrame, score_cfg: ScoreConfig) -> pl.DataFrame:
+    """Employee-level KPI table (Section 6).
+
+    ``Attendance_Score`` counts one "issue day" per calendar day that has
+    any anomaly (late, early leave, forgotten punch, unscheduled scan, ...),
+    so a single day is never penalised twice even if several things went
+    wrong on it. This mirrors how compliance is judged in HR practice: one
+    problematic day is one problematic day.
+    """
+    if daily.is_empty():
+        return pl.DataFrame()
+
+    df_calc = daily
+    if "Tidak_Absen_Pulang_Flag" not in df_calc.columns:
+        if "Status_Pulang" in df_calc.columns:
+            df_calc = df_calc.with_columns(
+                Tidak_Absen_Pulang_Flag=pl.when(pl.col("Status_Pulang") == "Lupa Absen Pulang")
+                .then(1)
+                .otherwise(0)
+                .cast(pl.Int64)
+            )
+        else:
+            df_calc = df_calc.with_columns(Tidak_Absen_Pulang_Flag=pl.lit(0, dtype=pl.Int64))
+
+    if "Overtime_Hours" not in df_calc.columns:
+        df_calc = df_calc.with_columns(Overtime_Hours=pl.lit(0.0, dtype=pl.Float64))
+
+    summary = df_calc.group_by(["No.", "Name", "Department", "Employee_Type"], maintain_order=True).agg(
+        Total_Hari=pl.len(),
+        Hari_Kerja=pl.col("Is_Working_Day").cast(pl.Int64).sum(),
+        Hadir=pl.col("Present_Flag").cast(pl.Int64).sum(),
+        Terlambat=pl.col("Late_Flag").cast(pl.Int64).sum(),
+        Total_Menit_Telat=pl.col("Menit_Telat").cast(pl.Int64).sum(),
+        Pulang_Cepat=pl.col("Early_Leave_Flag").cast(pl.Int64).sum(),
+        Total_Menit_Pulang_Cepat=pl.col("Menit_Pulang_Cepat").cast(pl.Int64).sum(),
+        Mangkir=pl.col("Absent_Flag").cast(pl.Int64).sum(),
+        Lupa_Absen=pl.col("Forgot_Punch_Flag").cast(pl.Int64).sum(),
+        Tidak_Absen_Pulang=pl.col("Tidak_Absen_Pulang_Flag").cast(pl.Int64).sum(),
+        Total_Jam_Lembur=pl.col("Overtime_Hours").cast(pl.Float64).sum(),
+        Anomali=pl.col("Is_Anomali").cast(pl.Int64).sum(),
+    )
+
+    summary = summary.with_columns(
+        **{
+            "Attendance_Rate_%": pl.when(pl.col("Hari_Kerja") > 0)
+            .then(pl.col("Hadir") / pl.col("Hari_Kerja") * 100.0)
+            .otherwise(100.0),
+            "Punctuality_Rate_%": pl.when(pl.col("Hari_Kerja") > 0)
+            .then(
+                (
+                    (pl.col("Hari_Kerja") - pl.col("Terlambat") - pl.col("Mangkir"))
+                    / pl.col("Hari_Kerja")
+                    * 100.0
+                ).clip(0.0, 100.0)
+            )
+            .otherwise(100.0),
+        }
+    )
+
+    work = df_calc.filter(pl.col("Is_Working_Day"))
+    if not work.is_empty():
+        issue_days = (
+            work.group_by(["No.", "Tanggal"])
+            .agg(pl.col("Is_Anomali").max())
+            .group_by("No.")
+            .agg(pl.col("Is_Anomali").sum().alias("_Issue_Days"))
+        )
+        summary = summary.join(issue_days, on="No.", how="left")
+        summary = summary.with_columns(_Issue_Days=pl.col("_Issue_Days").fill_null(0))
+    else:
+        summary = summary.with_columns(_Issue_Days=pl.lit(0, dtype=pl.Int64))
+
+    summary = summary.with_columns(
+        Attendance_Score=pl.when(pl.col("Hari_Kerja") > 0)
+        .then(((1.0 - pl.col("_Issue_Days") / pl.col("Hari_Kerja")) * 100.0).clip(0.0, 100.0))
+        .otherwise(100.0)
+    ).drop("_Issue_Days")
+
+    classifications = [score_cfg.classify(s) for s in summary["Attendance_Score"].to_list()]
+    summary = summary.with_columns(HR_Classification=pl.Series("HR_Classification", classifications, dtype=pl.String))
+
+    return summary.sort(["Attendance_Score", "Department", "Name"])
+
+
+def calculate_department_summary(daily: pl.DataFrame) -> pl.DataFrame:
+    """Department-level roll-up KPI table."""
+    if daily.is_empty():
+        return pl.DataFrame()
+
+    work = daily.filter(pl.col("Is_Working_Day"))
+    if work.is_empty():
+        return pl.DataFrame()
+
+    out = work.group_by("Department", maintain_order=True).agg(
+        Employee=pl.col("No.").n_unique(),
+        Working_Days=pl.col("Tanggal").n_unique(),
+        Total_Man_Days=pl.col("Work_Day_Flag").cast(pl.Int64).sum(),
+        Present=pl.col("Present_Flag").cast(pl.Int64).sum(),
+        Late=pl.col("Late_Flag").cast(pl.Int64).sum(),
+        Absent=pl.col("Absent_Flag").cast(pl.Int64).sum(),
+        Early_Leave=pl.col("Early_Leave_Flag").cast(pl.Int64).sum(),
+        Late_Minutes=pl.col("Menit_Telat").cast(pl.Int64).sum(),
+        Anomalies=pl.col("Is_Anomali").cast(pl.Int64).sum(),
+    )
+
+    out = out.with_columns(
+        **{
+            "Attendance_Rate_%": pl.when(pl.col("Total_Man_Days") > 0)
+            .then(pl.col("Present") / pl.col("Total_Man_Days") * 100.0)
+            .otherwise(100.0)
+        }
+    )
+
+    issue_days = (
+        work.group_by(["Department", "No.", "Tanggal"])
+        .agg(pl.col("Is_Anomali").max())
+        .group_by("Department")
+        .agg(pl.col("Is_Anomali").sum().alias("_Total_Issue_Days"))
+    )
+    out = out.join(issue_days, on="Department", how="left")
+    out = out.with_columns(_Total_Issue_Days=pl.col("_Total_Issue_Days").fill_null(0))
+    out = out.with_columns(
+        **{
+            "Attendance_Score_%": pl.when(pl.col("Total_Man_Days") > 0)
+            .then(((1.0 - pl.col("_Total_Issue_Days") / pl.col("Total_Man_Days")) * 100.0).clip(0.0, 100.0))
+            .otherwise(100.0)
+        }
+    ).drop("_Total_Issue_Days")
+
+    return out.sort("Attendance_Score_%")
+
+
+def calculate_daily_trend(daily: pl.DataFrame) -> pl.DataFrame:
+    """Daily attendance trend table."""
+    if daily.is_empty():
+        return pl.DataFrame()
+
+    work = daily.filter(pl.col("Is_Working_Day"))
+    if work.is_empty():
+        return pl.DataFrame()
+
+    trend = work.group_by("Tanggal", maintain_order=True).agg(
+        Work_Days=pl.col("Work_Day_Flag").cast(pl.Int64).sum(),
+        Present=pl.col("Present_Flag").cast(pl.Int64).sum(),
+        Late=pl.col("Late_Flag").cast(pl.Int64).sum(),
+        Absent=pl.col("Absent_Flag").cast(pl.Int64).sum(),
+        Early_Leave=pl.col("Early_Leave_Flag").cast(pl.Int64).sum(),
+        Late_Minutes=pl.col("Menit_Telat").cast(pl.Int64).sum(),
+    )
+    trend = trend.with_columns(
+        **{
+            "Attendance_Rate_%": pl.when(pl.col("Work_Days") > 0)
+            .then(pl.col("Present") / pl.col("Work_Days") * 100.0)
+            .otherwise(100.0)
+        }
+    )
+    return trend.sort("Tanggal")
+
+
+def derive_hr_insights(summary: pl.DataFrame, dept: pl.DataFrame) -> list[str]:
+    """Derive automated textual HR insights and priorities from analytics tables."""
+    insights: list[str] = []
+    if summary.is_empty():
+        return ["Belum ada data yang dapat dianalisis."]
+
+    worst = summary.sort("Attendance_Score").head(5)
+    if not worst.is_empty():
+        emp = worst.row(0, named=True)
+        insights.append(
+            f"Prioritas HR: {emp['Name']} ({emp['Department']}) "
+            f"memiliki attendance score {emp['Attendance_Score']:.1f}%."
+        )
+
+    late_minutes = int(summary["Total_Menit_Telat"].sum()) if "Total_Menit_Telat" in summary.columns else 0
+    if late_minutes:
+        insights.append(
+            f"Total keterlambatan mencapai {late_minutes:,} menit; "
+            "pertimbangkan coaching berdasarkan pola departemen/hari."
+        )
+
+    if not dept.is_empty():
+        d = dept.row(0, named=True)
+        insights.append(
+            f"Departemen dengan attendance score terendah saat ini adalah "
+            f"{d['Department']} ({d['Attendance_Score_%']:.1f}%)."
+        )
+
+    high_absence = summary.filter(pl.col("Mangkir") > 0) if "Mangkir" in summary.columns else pl.DataFrame()
+    if len(high_absence):
+        insights.append(f"{len(high_absence)} karyawan memiliki setidaknya satu hari mangkir.")
+
+    forgot = summary.filter(pl.col("Lupa_Absen") > 0) if "Lupa_Absen" in summary.columns else pl.DataFrame()
+    if len(forgot):
+        insights.append(f"{len(forgot)} karyawan memiliki kejadian lupa absen masuk/pulang.")
+
+    if "Tidak_Absen_Pulang" in summary.columns and "Employee_Type" in summary.columns:
+        sales_subset = summary.filter(pl.col("Employee_Type") == "SALES")
+        sales_no_out = int(sales_subset["Tidak_Absen_Pulang"].sum()) if not sales_subset.is_empty() else 0
+        if sales_no_out > 0:
+            insights.append(
+                f"Anomali Sales: Terdeteksi {sales_no_out} kejadian tidak absen pulang pada tim Sales "
+                "(perlu verifikasi tugas lapangan vs mangkir/pulang awal)."
+            )
+
+    return insights
+</file>
+
+<file path="src/attendance/engine.py">
+"""
+Daily attendance calculation engine (Sections 2, 3, 5, 17).
+
+Core rule, unchanged from the original implementation and preserved as the
+single source of truth for the whole system:
+
+    * FIRST scan of a calendar day  -> Status Masuk (clock-in)
+    * LAST  scan of a calendar day  -> Status Pulang (clock-out)
+    * Any scan in between is preserved for audit but is NEVER interpreted
+      as a break / canvassing / re-entry — for SALES employees especially,
+      canvassing time is simply not observable in the fingerprint log
+      (Section 3) and this engine makes no attempt to infer it.
+
+Severity taxonomy follows Section 5 exactly: HIGH, LOW, or blank ("") when
+the day is normal. Anomaly_Type follows the taxonomy listed in Section 5.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from datetime import date, datetime, time, timedelta
+from typing import Iterable, Optional
+
+import polars as pl
+
+from application.config import AttendanceConfig
+from .parser import DAY_ID, WEEKDAY_NUM_MAP
+
+
+def _parse_time_str(val: object) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, time):
+        return val.strftime("%H:%M:%S")
+    if isinstance(val, datetime):
+        return val.time().strftime("%H:%M:%S")
+    s = str(val).strip().replace(".", ":")
+    if not s or s.lower() in ("none", "nan", "nat", "<null>", ""):
+        return None
+    parts = s.split(":")
+    if len(parts) >= 2:
+        try:
+            h, m = int(parts[0]), int(parts[1])
+            sec = int(parts[2]) if len(parts) > 2 else 0
+            return f"{h:02d}:{m:02d}:{sec:02d}"
+        except ValueError:
+            return None
+    return None
+
+
+def build_employee_directory(df: pl.DataFrame) -> pl.DataFrame:
+    """One row per employee, resolving the Name/Department/Employee_Type/Schedule
+    seen in the log or merged master.
+    """
+    if df.is_empty():
+        return pl.DataFrame(
+            schema={
+                "No.": pl.String,
+                "Name": pl.String,
+                "Department": pl.String,
+                "Employee_Type": pl.String,
+                "Position": pl.String,
+                "Jam_Masuk_Master": pl.String,
+                "Jam_Pulang_Master": pl.String,
+            }
+        )
+
+    agg_exprs = [
+        pl.col("Name").drop_nulls().first().alias("Name"),
+        pl.col("Department").drop_nulls().first().alias("Department"),
+    ]
+    if "Employee_Type" in df.columns:
+        agg_exprs.append(pl.col("Employee_Type").drop_nulls().first().fill_null("OFFICE").alias("Employee_Type"))
+    else:
+        agg_exprs.append(pl.lit("OFFICE", dtype=pl.String).alias("Employee_Type"))
+
+    if "Position" in df.columns:
+        agg_exprs.append(pl.col("Position").drop_nulls().first().fill_null("").alias("Position"))
+    else:
+        agg_exprs.append(pl.lit("", dtype=pl.String).alias("Position"))
+
+    if "Jam_Masuk_Master" in df.columns:
+        agg_exprs.append(pl.col("Jam_Masuk_Master").drop_nulls().first().alias("Jam_Masuk_Master"))
+    else:
+        agg_exprs.append(pl.lit(None, dtype=pl.String).alias("Jam_Masuk_Master"))
+
+    if "Jam_Pulang_Master" in df.columns:
+        agg_exprs.append(pl.col("Jam_Pulang_Master").drop_nulls().first().alias("Jam_Pulang_Master"))
+    else:
+        agg_exprs.append(pl.lit(None, dtype=pl.String).alias("Jam_Pulang_Master"))
+
+    directory = df.group_by("No.").agg(agg_exprs)
+    return directory.sort(["Department", "Name"])
+
+
+def build_daily_attendance(
+    enriched_log: pl.DataFrame,
+    cfg: AttendanceConfig,
+    holidays: Optional[Iterable[date]] = None,
+    approved_leave: Optional[pl.DataFrame | object] = None,
+    leave_result: Optional[object] = None,
+) -> pl.DataFrame:
+    """Build the Daily Attendance table (Section 5) using native vectorized Polars expressions."""
+    if enriched_log.is_empty():
+        return pl.DataFrame()
+
+    df_log = enriched_log
+    holidays_set = set(holidays or [])
+
+    # Support both legacy DataFrame and LeaveLoadResult
+    lr = leave_result
+    if lr is None and hasattr(approved_leave, "leaves") and hasattr(approved_leave, "group_events"):
+        lr = approved_leave
+        leave = pl.DataFrame(schema={"No.": pl.String, "Tanggal": pl.Date, "Leave_Type": pl.String})
+    elif isinstance(approved_leave, pl.DataFrame):
+        leave = approved_leave
+    elif approved_leave is not None and hasattr(approved_leave, "to_dict"):
+        leave = pl.from_pandas(approved_leave)
+    else:
+        leave = pl.DataFrame(schema={"No.": pl.String, "Tanggal": pl.Date, "Leave_Type": pl.String})
+
+    start = cfg.start_date or df_log["Tanggal"].min()
+    end = cfg.end_date or df_log["Tanggal"].max()
+
+    employees = build_employee_directory(df_log)
+    date_list = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    dates_df = pl.DataFrame({"Tanggal": date_list}, schema={"Tanggal": pl.Date})
+
+    daily = employees.join(dates_df, how="cross")
+
+    daily = daily.with_columns(
+        Hari=pl.col("Tanggal").dt.weekday().replace_strict(WEEKDAY_NUM_MAP, default="Senin"),
+        Is_Holiday=pl.col("Tanggal").is_in(list(holidays_set)),
+    )
+
+    working_days = list(cfg.working_days)
+
+    if not leave.is_empty() and "No." in leave.columns and "Tanggal" in leave.columns:
+        leave_sub = leave.select(["No.", "Tanggal", "Leave_Type"]).unique(subset=["No.", "Tanggal"])
+        daily = daily.join(leave_sub, on=["No.", "Tanggal"], how="left")
+        daily = daily.with_columns(
+            Is_Approved_Leave=pl.col("Leave_Type").is_not_null() & (pl.col("Leave_Type") != ""),
+            Leave_Type=pl.col("Leave_Type").fill_null(""),
+        )
+    else:
+        daily = daily.with_columns(
+            Is_Approved_Leave=pl.lit(False, dtype=pl.Boolean),
+            Leave_Type=pl.lit("", dtype=pl.String),
+        )
+
+    daily = daily.with_columns(
+        Is_Working_Day=pl.col("Hari").is_in(working_days) & ~pl.col("Is_Holiday") & ~pl.col("Is_Approved_Leave")
+    )
+
+    # Vectorized scan aggregation per employee per day
+    cutoff_time = cfg.single_scan_cutoff
+    cutoff_str = cutoff_time.strftime("%H:%M:%S")
+
+    scans_grouped = (
+        df_log.sort(["No.", "Tanggal", "Date/Time"])
+        .group_by(["No.", "Tanggal"], maintain_order=True)
+        .agg(
+            pl.col("Date/Time").first().alias("_first_raw"),
+            pl.col("Date/Time").last().alias("_last_raw"),
+            pl.len().alias("Scan_Count"),
+        )
+    )
+
+    # Vectorize single-scan vs multi-scan extraction
+    is_single_morning = (pl.col("Scan_Count") == 1) & (
+        pl.col("_first_raw").dt.strftime("%H:%M:%S") < cutoff_str
+    )
+    is_single_afternoon = (pl.col("Scan_Count") == 1) & (
+        pl.col("_first_raw").dt.strftime("%H:%M:%S") >= cutoff_str
+    )
+    is_multi = pl.col("Scan_Count") > 1
+
+    scans_df = scans_grouped.with_columns(
+        First_Scan=pl.when(is_single_morning | is_multi)
+        .then(pl.col("_first_raw"))
+        .otherwise(None)
+        .cast(pl.Datetime),
+        Last_Scan=pl.when(is_single_afternoon)
+        .then(pl.col("_first_raw"))
+        .when(is_multi)
+        .then(pl.col("_last_raw"))
+        .otherwise(None)
+        .cast(pl.Datetime),
+    ).select(["No.", "Tanggal", "First_Scan", "Last_Scan", "Scan_Count"])
+
+    daily = daily.join(scans_df, on=["No.", "Tanggal"], how="left")
+    daily = daily.with_columns(Scan_Count=pl.col("Scan_Count").fill_null(0).cast(pl.Int64))
+
+    # Vectorized schedule calculation
+    in_time_str = cfg.clock_in.strftime("%H:%M:%S")
+    out_weekday_str = cfg.weekday_clock_out.strftime("%H:%M:%S")
+    out_sat_str = cfg.saturday_clock_out.strftime("%H:%M:%S")
+
+    # Format Master In/Out to HH:MM:SS format
+    daily = daily.with_columns(
+        _in_time_norm=pl.coalesce(
+            [
+                pl.col("Jam_Masuk_Master").str.to_time("%H:%M", strict=False).dt.strftime("%H:%M:%S"),
+                pl.col("Jam_Masuk_Master").str.to_time("%H:%M:%S", strict=False).dt.strftime("%H:%M:%S"),
+                pl.lit(in_time_str),
+            ]
+        ),
+        _out_default=pl.when(pl.col("Hari") == "Sabtu").then(pl.lit(out_sat_str)).otherwise(pl.lit(out_weekday_str)),
+    )
+    daily = daily.with_columns(
+        _out_time_norm=pl.coalesce(
+            [
+                pl.col("Jam_Pulang_Master").str.to_time("%H:%M", strict=False).dt.strftime("%H:%M:%S"),
+                pl.col("Jam_Pulang_Master").str.to_time("%H:%M:%S", strict=False).dt.strftime("%H:%M:%S"),
+                pl.col("_out_default"),
+            ]
+        )
+    )
+
+    # Combine Tanggal + Time into Datetime
+    schedule_in_expr = (
+        pl.concat_str([pl.col("Tanggal").cast(pl.String), pl.lit(" "), pl.col("_in_time_norm")])
+        .str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False)
+    )
+    grace_until_expr = schedule_in_expr + pl.duration(minutes=cfg.grace_minutes)
+
+    schedule_out_expr = (
+        pl.concat_str([pl.col("Tanggal").cast(pl.String), pl.lit(" "), pl.col("_out_time_norm")])
+        .str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False)
+    )
+
+    daily = daily.with_columns(
+        _schedule_in=schedule_in_expr,
+        _grace_until=grace_until_expr,
+        _schedule_out=schedule_out_expr,
+    )
+
+    # Vectorized Status Masuk
+    status_masuk_expr = (
+        pl.when(pl.col("Is_Approved_Leave"))
+        .then(pl.lit("Cuti Disetujui"))
+        .when(~pl.col("Is_Working_Day") & (pl.col("Scan_Count") == 0))
+        .then(pl.lit("Libur"))
+        .when(~pl.col("Is_Working_Day"))
+        .then(pl.lit("Scan Hari Libur"))
+        .when(pl.col("Scan_Count") == 0)
+        .then(pl.lit("Mangkir"))
+        .when(pl.col("First_Scan").is_null())
+        .then(pl.lit("Lupa Absen Masuk"))
+        .when(pl.col("First_Scan") > pl.col("_grace_until"))
+        .then(pl.lit("Terlambat"))
+        .otherwise(pl.lit("Hadir"))
+    )
+
+    # Vectorized Status Pulang
+    status_pulang_expr = (
+        pl.when(pl.col("Is_Approved_Leave"))
+        .then(pl.when(pl.col("Leave_Type") != "").then(pl.col("Leave_Type")).otherwise(pl.lit("Approved Leave")))
+        .when(~pl.col("Is_Working_Day") & (pl.col("Scan_Count") == 0))
+        .then(pl.lit("Libur Normal"))
+        .when(~pl.col("Is_Working_Day"))
+        .then(pl.lit("Scan Hari Libur"))
+        .when(pl.col("Scan_Count") == 0)
+        .then(pl.lit("Mangkir"))
+        .when(pl.col("Last_Scan").is_null())
+        .then(pl.lit("Lupa Absen Pulang"))
+        .when(pl.col("Last_Scan") < pl.col("_schedule_out"))
+        .then(pl.lit("Pulang Cepat"))
+        .otherwise(pl.lit("OK"))
+    )
+
+    daily = daily.with_columns(
+        Status_Masuk=status_masuk_expr,
+        Status_Pulang=status_pulang_expr,
+    )
+
+    # Vectorized Menit Telat & Pulang Cepat
+    late_diff_minutes = (
+        (pl.col("First_Scan") - pl.col("_schedule_in")).dt.total_seconds() / 60.0
+    ).floor().cast(pl.Int64).clip(lower_bound=0)
+
+    early_diff_minutes = (
+        (pl.col("_schedule_out") - pl.col("Last_Scan")).dt.total_seconds() / 60.0
+    ).floor().cast(pl.Int64).clip(lower_bound=0)
+
+    daily = daily.with_columns(
+        Menit_Telat=pl.when(pl.col("Is_Approved_Leave") | ~pl.col("Is_Working_Day") | (pl.col("Scan_Count") == 0))
+        .then(pl.lit(0, dtype=pl.Int64))
+        .when(pl.col("Status_Masuk") == "Lupa Absen Masuk")
+        .then(pl.lit(cfg.default_late_minutes_when_only_clock_out, dtype=pl.Int64))
+        .when(pl.col("Status_Masuk") == "Terlambat")
+        .then(late_diff_minutes)
+        .otherwise(pl.lit(0, dtype=pl.Int64)),
+        Menit_Pulang_Cepat=pl.when(
+            pl.col("Is_Approved_Leave") | ~pl.col("Is_Working_Day") | (pl.col("Scan_Count") == 0)
+        )
+        .then(pl.lit(0, dtype=pl.Int64))
+        .when(pl.col("Status_Pulang") == "Pulang Cepat")
+        .then(early_diff_minutes)
+        .otherwise(pl.lit(0, dtype=pl.Int64)),
+    )
+
+    # Vectorized Anomaly_Type & Severity
+    anom_list_expr = pl.concat_list(
+        [
+            pl.when(
+                pl.col("First_Scan").is_null()
+                & (pl.col("Scan_Count") > 0)
+                & pl.col("Is_Working_Day")
+                & ~pl.col("Is_Approved_Leave")
+            )
+            .then(pl.lit("Hanya Scan Siang/Sore"))
+            .otherwise(None),
+            pl.when(
+                pl.col("Last_Scan").is_null()
+                & (pl.col("Scan_Count") > 0)
+                & pl.col("Is_Working_Day")
+                & pl.col("First_Scan").is_not_null()
+                & ~pl.col("Is_Approved_Leave")
+            )
+            .then(pl.lit("Hanya Scan Pagi"))
+            .otherwise(None),
+            pl.when(
+                (pl.col("Scan_Count") > 2)
+                & pl.col("Is_Working_Day")
+                & ~pl.col("Is_Approved_Leave")
+            )
+            .then(pl.lit("Transaksi Lebih Dari Dua Kali"))
+            .otherwise(None),
+        ]
+    ).list.drop_nulls().list.join(", ")
+
+    anomaly_type_expr = (
+        pl.when(pl.col("Is_Approved_Leave"))
+        .then(pl.lit(""))
+        .when(~pl.col("Is_Working_Day") & (pl.col("Scan_Count") > 0))
+        .then(pl.lit("Scan Pada Hari Libur"))
+        .when(~pl.col("Is_Working_Day"))
+        .then(pl.lit(""))
+        .when(pl.col("Scan_Count") == 0)
+        .then(pl.lit("Tidak Ada Transaksi"))
+        .otherwise(anom_list_expr)
+    )
+
+    severity_expr = (
+        pl.when(pl.col("Is_Approved_Leave"))
+        .then(pl.lit(""))
+        .when(~pl.col("Is_Working_Day") & (pl.col("Scan_Count") > 0))
+        .then(pl.lit("LOW"))
+        .when(~pl.col("Is_Working_Day"))
+        .then(pl.lit(""))
+        .when(pl.col("Scan_Count") == 0)
+        .then(pl.lit("HIGH"))
+        .when(
+            (pl.col("Status_Masuk") == "Lupa Absen Masuk")
+            | (pl.col("Status_Pulang") == "Lupa Absen Pulang")
+        )
+        .then(pl.lit("HIGH"))
+        .when(
+            (pl.col("Status_Masuk") == "Terlambat")
+            | (pl.col("Status_Pulang") == "Pulang Cepat")
+            | (pl.col("Scan_Count") > 2)
+        )
+        .then(pl.lit("LOW"))
+        .otherwise(pl.lit(""))
+    )
+
+    daily = daily.with_columns(
+        Anomaly_Type=anomaly_type_expr,
+        Severity=severity_expr,
+    )
+
+    # Duration and flags
+    duration_secs = (pl.col("Last_Scan") - pl.col("First_Scan")).dt.total_seconds()
+    daily = daily.with_columns(
+        Jam_Masuk=pl.col("First_Scan").dt.strftime("%H:%M:%S").fill_null(""),
+        Jam_Pulang=pl.col("Last_Scan").dt.strftime("%H:%M:%S").fill_null(""),
+        Work_Duration_Minutes=pl.when(pl.col("First_Scan").is_not_null() & pl.col("Last_Scan").is_not_null())
+        .then((duration_secs / 60.0).round(0))
+        .otherwise(None),
+        Is_Anomali=pl.when(pl.col("Severity") != "").then(1).otherwise(0).cast(pl.Int64),
+        Work_Day_Flag=pl.when(pl.col("Is_Working_Day")).then(1).otherwise(0).cast(pl.Int64),
+        Present_Flag=pl.when(pl.col("Status_Masuk").is_in(["Hadir", "Terlambat"])).then(1).otherwise(0).cast(pl.Int64),
+        Late_Flag=pl.when(pl.col("Status_Masuk") == "Terlambat").then(1).otherwise(0).cast(pl.Int64),
+        Absent_Flag=pl.when(pl.col("Status_Masuk") == "Mangkir").then(1).otherwise(0).cast(pl.Int64),
+        Early_Leave_Flag=pl.when(pl.col("Status_Pulang") == "Pulang Cepat").then(1).otherwise(0).cast(pl.Int64),
+        Forgot_Punch_Flag=pl.when(
+            (pl.col("Status_Masuk") == "Lupa Absen Masuk") | (pl.col("Status_Pulang") == "Lupa Absen Pulang")
+        )
+        .then(1)
+        .otherwise(0)
+        .cast(pl.Int64),
+        Tidak_Absen_Pulang_Flag=pl.when(pl.col("Status_Pulang") == "Lupa Absen Pulang").then(1).otherwise(0).cast(pl.Int64),
+    )
+
+    # Drop temporary calculation columns
+    daily = daily.drop(
+        ["_in_time_norm", "_out_default", "_out_time_norm", "_schedule_in", "_grace_until", "_schedule_out"]
+    )
+
+    # If leave result (multi-sheet Cuti, Lembur, Kegiatan Bersama) provided, apply integration
+    if lr is not None:
+        from application.leave import apply_leave_kegiatan
+        daily = apply_leave_kegiatan(daily, lr)
+
+    ordered_cols = [
+        "No.", "Name", "Department", "Employee_Type", "Position",
+        "Tanggal", "Hari", "Is_Working_Day", "Is_Holiday",
+        "Jam_Masuk", "Jam_Pulang", "Scan_Count",
+        "Status_Masuk", "Status_Pulang", "Menit_Telat", "Menit_Pulang_Cepat",
+        "Work_Duration_Minutes", "Anomaly_Type", "Severity", "Is_Anomali",
+        "Work_Day_Flag", "Present_Flag", "Late_Flag", "Absent_Flag",
+        "Early_Leave_Flag", "Forgot_Punch_Flag", "Tidak_Absen_Pulang_Flag",
+        "Overtime_Hours", "Overtime_Status", "Group_Event",
+        "First_Scan", "Last_Scan",
+    ]
+    avail_cols = [c for c in ordered_cols if c in daily.columns]
+    daily = daily.select(avail_cols)
+
+    return daily.sort(["Tanggal", "Department", "Name"])
+</file>
+
+<file path="src/attendance/parser.py">
+"""
+Raw attendance log ingestion.
+
+This module only validates and cleans the raw machine export — it never
+decides what a scan *means* (that is the attendance engine's job). Raw rows
+are never mutated or dropped silently: anything excluded from calculation is
+returned in a separate ``rejected`` DataFrame with a reason, preserving full
+audit trail (Section 15).
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Optional
+
+import polars as pl
+
+REQUIRED_COLUMNS = {"No.", "Date/Time"}
+
+DAY_ID = {
+    "Monday": "Senin",
+    "Tuesday": "Selasa",
+    "Wednesday": "Rabu",
+    "Thursday": "Kamis",
+    "Friday": "Jumat",
+    "Saturday": "Sabtu",
+    "Sunday": "Minggu",
+}
+
+WEEKDAY_NUM_MAP = {
+    1: "Senin",
+    2: "Selasa",
+    3: "Rabu",
+    4: "Kamis",
+    5: "Jumat",
+    6: "Sabtu",
+    7: "Minggu",
+}
+
+
+class AttendanceValidationError(ValueError):
+    """Raised when the uploaded attendance file cannot be processed safely."""
+
+
+def _clean_column_name(value: object) -> str:
+    return str(value).replace("\n", " ").replace("\r", " ").strip()
+
+
+def parse_datetime_expr(col_name: str = "Date/Time") -> pl.Expr:
+    """Robustly parse attendance-machine timestamps into pl.Datetime."""
+    s = pl.col(col_name).cast(pl.String).str.strip_chars().str.replace_all(r"\.", ":")
+    return pl.coalesce(
+        [
+            s.str.to_datetime("%d/%m/%Y %H:%M:%S", strict=False),
+            s.str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False),
+            s.str.to_datetime("%d-%m-%Y %H:%M:%S", strict=False),
+            s.str.to_datetime("%Y/%m/%d %H:%M:%S", strict=False),
+            s.str.to_datetime("%d/%m/%Y %H:%M", strict=False),
+            s.str.to_datetime("%Y-%m-%d %H:%M", strict=False),
+            s.str.to_datetime(strict=False),
+        ]
+    )
+
+
+def validate_schema(df: pl.DataFrame) -> list[str]:
+    issues: list[str] = []
+    missing = REQUIRED_COLUMNS.difference(set(df.columns))
+    if missing:
+        issues.append(f"Kolom wajib tidak ditemukan: {', '.join(sorted(missing))}")
+    if df.is_empty():
+        issues.append("File tidak memiliki baris data.")
+    return issues
+
+
+def clean_attendance_data(raw_input: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
+    """Validate + clean a raw attendance-machine export.
+
+    Returns
+    -------
+    clean_df   rows safe to feed into the attendance engine
+    rejected_df rows excluded, each tagged with ``_reject_reason``
+    quality    data-quality metrics for the UI / README sheet
+    """
+    raw_df = raw_input
+    if raw_df.is_empty() and not raw_df.columns:
+        raise AttendanceValidationError("File tidak memiliki baris data.")
+
+    rename_map = {c: _clean_column_name(c) for c in raw_df.columns}
+    df = raw_df.rename(rename_map)
+
+    schema_issues = validate_schema(df)
+    if schema_issues:
+        raise AttendanceValidationError("; ".join(schema_issues))
+
+    input_row_count = len(df)
+    df = df.with_columns(_source_row=pl.int_range(2, pl.len() + 2, dtype=pl.Int64))
+
+    for col in ["No.", "Name", "Department"]:
+        if col not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype=pl.String).alias(col))
+        else:
+            df = df.with_columns(pl.col(col).cast(pl.String).str.strip_chars().alias(col))
+
+    rejected_parts: list[pl.DataFrame] = []
+
+    # 1. Check valid identity
+    invalid_identity_mask = pl.col("No.").is_null() | (pl.col("No.").str.strip_chars() == "")
+    bad_id = df.filter(invalid_identity_mask)
+    if not bad_id.is_empty():
+        bad_id = bad_id.with_columns(_reject_reason=pl.lit("Employee ID (No.) kosong/tidak valid"))
+        rejected_parts.append(bad_id)
+    df = df.filter(~invalid_identity_mask)
+
+    # Missing metadata fallback
+    df = df.with_columns(
+        Name=pl.when(pl.col("Name").is_null() | (pl.col("Name").str.strip_chars() == ""))
+        .then(pl.concat_str([pl.lit("Karyawan "), pl.col("No.")]))
+        .otherwise(pl.col("Name")),
+        Department=pl.when(pl.col("Department").is_null() | (pl.col("Department").str.strip_chars() == ""))
+        .then(pl.lit("Belum Dipetakan"))
+        .otherwise(pl.col("Department")),
+    )
+
+    # 2. Parse Date/Time
+    parsed_dt = parse_datetime_expr("Date/Time")
+    df = df.with_columns(_parsed_dt=parsed_dt)
+
+    invalid_dt_mask = pl.col("_parsed_dt").is_null()
+    bad_dt = df.filter(invalid_dt_mask)
+    if not bad_dt.is_empty():
+        bad_dt = bad_dt.drop("_parsed_dt").with_columns(
+            _reject_reason=pl.lit("Tanggal/jam tidak dapat dibaca")
+        )
+        rejected_parts.append(bad_dt)
+    df = df.filter(~invalid_dt_mask)
+    df = df.with_columns(pl.col("_parsed_dt").alias("Date/Time")).drop("_parsed_dt")
+
+    all_cols = list(df.columns)
+    if rejected_parts:
+        rejected = pl.concat(
+            [part.select([c for c in all_cols if c in part.columns] + ["_reject_reason"]) for part in rejected_parts],
+            how="diagonal",
+        )
+    else:
+        schema = {c: df.schema.get(c, pl.String) for c in all_cols}
+        schema["_reject_reason"] = pl.String
+        rejected = pl.DataFrame(schema=schema)
+
+    df = df.sort(["No.", "Date/Time", "_source_row"])
+
+    # 3. Deduplicate
+    before_dedup = len(df)
+    df = df.unique(subset=["No.", "Date/Time"], keep="first")
+    duplicate_count = before_dedup - len(df)
+
+    df = df.with_columns(
+        Tanggal=pl.col("Date/Time").dt.date(),
+        Waktu=pl.col("Date/Time").dt.time(),
+        Hari=pl.col("Date/Time").dt.weekday().replace_strict(WEEKDAY_NUM_MAP, default="Senin"),
+    )
+
+    min_date = df["Tanggal"].min() if not df.is_empty() else None
+    max_date = df["Tanggal"].max() if not df.is_empty() else None
+    employee_count = df["No."].n_unique() if not df.is_empty() else 0
+
+    quality = {
+        "input_rows": input_row_count,
+        "valid_rows": len(df),
+        "rejected_rows": len(rejected),
+        "duplicate_rows_removed": duplicate_count,
+        "date_min": min_date,
+        "date_max": max_date,
+        "employees": employee_count,
+    }
+    return df, rejected, quality
+
+
+def clean_approved_leave(leave_input: Optional[pl.DataFrame]) -> pl.DataFrame:
+    """Optional HR-approved leave/permission input (excludes days from
+    absence calculation; never invented, only used when HR supplies it).
+    """
+    if leave_input is None or leave_input.is_empty():
+        return pl.DataFrame(schema={"No.": pl.String, "Tanggal": pl.Date, "Leave_Type": pl.String})
+
+    df = leave_input
+    rename_map = {c: _clean_column_name(c) for c in df.columns}
+    df = df.rename(rename_map)
+
+    id_col = next((c for c in ["No.", "Employee ID", "ID", "NIK"] if c in df.columns), None)
+    date_col = next((c for c in ["Tanggal", "Date", "Leave Date"] if c in df.columns), None)
+    type_col = next((c for c in ["Type", "Leave Type", "Jenis"] if c in df.columns), None)
+
+    if not id_col or not date_col:
+        raise AttendanceValidationError(
+            "File leave harus memiliki kolom employee ID (No./Employee ID/ID/NIK) "
+            "dan tanggal (Tanggal/Date/Leave Date)."
+        )
+
+    out = df.select(
+        pl.col(id_col).cast(pl.String).str.strip_chars().alias("No."),
+        parse_datetime_expr(date_col).dt.date().alias("Tanggal"),
+        (
+            pl.col(type_col).cast(pl.String).str.strip_chars()
+            if type_col
+            else pl.lit("Approved Leave", dtype=pl.String)
+        ).alias("Leave_Type"),
+    )
+    out = out.filter(pl.col("No.").is_not_null() & (pl.col("No.") != "") & pl.col("Tanggal").is_not_null())
+    out = out.unique(subset=["No.", "Tanggal"], keep="last")
+    return out
+</file>
+
+<file path="src/reporting/__init__.py">
+"""Excel workbook generation."""
+</file>
+
+<file path="src/reporting/excel_report.py">
+"""
+Comprehensive Excel report generator (Section 13).
+
+Renders the complete audit package — from the executive dashboard with
+KPI cards and native openpyxl charts down to the verbatim audit trail of
+raw scans and rejected rows.
+"""
+
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass
+from typing import Optional
+
+import polars as pl
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
+
+from application.config import AppConfig, config_to_dataframe
+
+NAVY = "1F4E78"
+DARK_SLATE = "2F5597"
+ACCENT_BLUE = "D9E1F2"
+LIGHT_GRAY = "F2F2F2"
+WHITE = "FFFFFF"
+BORDER_GRAY = "D9D9D9"
+
+HEADER_FILL = PatternFill("solid", fgColor=NAVY)
+HEADER_FONT = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
+SECTION_FILL = PatternFill("solid", fgColor=DARK_SLATE)
+SECTION_FONT = Font(name="Segoe UI", size=11, bold=True, color=WHITE)
+CARD_VALUE_FONT = Font(name="Segoe UI", size=20, bold=True, color=NAVY)
+CARD_LABEL_FONT = Font(name="Segoe UI", size=9, bold=False, color="595959")
+INSIGHT_FONT = Font(name="Segoe UI", size=10, italic=False, color="1F4E78")
+INSIGHT_HEADER_FONT = Font(name="Segoe UI", size=11, bold=True, color=NAVY)
+
+THIN_SIDE = Side(border_style="thin", color=BORDER_GRAY)
+CARD_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
+
+
+@dataclass
+class ReportData:
+    config: AppConfig
+    employee_master: pl.DataFrame
+    raw_log: pl.DataFrame
+    daily_attendance: pl.DataFrame
+    employee_summary: pl.DataFrame
+    department_summary: pl.DataFrame
+    daily_trend: pl.DataFrame
+    anomalies: pl.DataFrame
+    rejected: pl.DataFrame
+    payroll: pl.DataFrame
+    sales_activity: pl.DataFrame
+    sales_performance: pl.DataFrame
+    insights: list[str]
+    report_period_label: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Generic sheet helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_table(ws: Worksheet, df: Optional[pl.DataFrame], start_row: int = 1, start_col: int = 1) -> tuple[int, int]:
+    """Write a styled table starting at (start_row, start_col). Returns the
+    (last_row, last_col) written."""
+    if df is None or df.is_empty():
+        cell = ws.cell(row=start_row, column=start_col, value="(Tidak ada data)")
+        cell.font = Font(italic=True, color="7F7F7F")
+        return start_row, start_col
+
+    for j, col_name in enumerate(df.columns):
+        cell = ws.cell(row=start_row, column=start_col + j, value=str(col_name))
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for i, row in enumerate(df.iter_rows(named=False), start=1):
+        for j, value in enumerate(row):
+            cell = ws.cell(row=start_row + i, column=start_col + j, value=value)
+            if i % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+
+    last_row = start_row + len(df)
+    last_col = start_col + len(df.columns) - 1
+    ws.auto_filter.ref = (
+        f"{get_column_letter(start_col)}{start_row}:{get_column_letter(last_col)}{last_row}"
+    )
+    ws.freeze_panes = ws.cell(row=start_row + 1, column=start_col).coordinate
+    return last_row, last_col
+
+
+def _autofit(ws: Worksheet, max_scan_row: int = 2000) -> None:
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        longest = 0
+        for row_idx in range(1, min(ws.max_row, max_scan_row) + 1):
+            value = ws.cell(row_idx, col_idx).value
+            if value is not None:
+                longest = max(longest, len(str(value)))
+        ws.column_dimensions[letter].width = min(max(longest + 2, 10), 42)
+
+
+def _data_sheet(wb: Workbook, name: str, df: Optional[pl.DataFrame]) -> Worksheet:
+    ws = wb.create_sheet(name)
+    ws.sheet_view.showGridLines = False
+    _write_table(ws, df)
+    _autofit(ws)
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# KPI card helper (used on the dashboard)
+# ---------------------------------------------------------------------------
+
+
+def _kpi_card(ws: Worksheet, row: int, col: int, label: str, value: str, accent: str = ACCENT_BLUE) -> None:
+    label_cell = ws.cell(row=row, column=col, value=label)
+    label_cell.font = CARD_LABEL_FONT
+    label_cell.alignment = Alignment(horizontal="center", vertical="center")
+    label_cell.fill = PatternFill("solid", fgColor=accent)
+    label_cell.border = CARD_BORDER
+
+    val_cell = ws.cell(row=row + 1, column=col, value=value)
+    val_cell.font = CARD_VALUE_FONT
+    val_cell.alignment = Alignment(horizontal="center", vertical="center")
+    val_cell.border = CARD_BORDER
+
+
+def _section_title(ws: Worksheet, row: int, col: int, text: str, span: int = 6) -> None:
+    for c in range(col, col + span):
+        cell = ws.cell(row=row, column=c)
+        cell.fill = SECTION_FILL
+    title_cell = ws.cell(row=row, column=col, value=text)
+    title_cell.font = SECTION_FONT
+    title_cell.alignment = Alignment(vertical="center")
+    ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + span - 1)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard builder
+# ---------------------------------------------------------------------------
+
+
+def _build_dashboard(wb: Workbook, data: ReportData) -> None:
+    ws = wb.create_sheet("DASHBOARD")
+    ws.sheet_view.showGridLines = False
+
+    # Title block
+    ws.merge_cells("A1:K1")
+    title = ws.cell(row=1, column=1, value="DEALERSHIP HR & SALES PERFORMANCE DASHBOARD")
+    title.font = Font(name="Segoe UI", size=14, bold=True, color=WHITE)
+    title.fill = HEADER_FILL
+    title.alignment = Alignment(vertical="center", indent=1)
+    ws.row_dimensions[1].height = 28
+
+    if data.report_period_label:
+        ws.merge_cells("A2:K2")
+        sub = ws.cell(row=2, column=1, value=f"Periode Laporan: {data.report_period_label}")
+        sub.font = Font(name="Segoe UI", size=10, italic=True, color="595959")
+
+    # KPI summary numbers
+    summary = data.employee_summary
+    total_emp = summary["No."].n_unique() if not summary.is_empty() else 0
+    total_late = int(summary["Terlambat"].sum()) if not summary.is_empty() and "Terlambat" in summary.columns else 0
+    total_absent = int(summary["Mangkir"].sum()) if not summary.is_empty() and "Mangkir" in summary.columns else 0
+    avg_score = summary["Attendance_Score"].mean() if not summary.is_empty() and "Attendance_Score" in summary.columns else 100.0
+
+    sales_perf = data.sales_performance
+    total_spk = int(sales_perf["SPK"].sum()) if not sales_perf.is_empty() and "SPK" in sales_perf.columns else 0
+    total_delivery = int(sales_perf["Delivery"].sum()) if not sales_perf.is_empty() and "Delivery" in sales_perf.columns else 0
+    total_revenue = float(sales_perf["Revenue"].sum()) if not sales_perf.is_empty() and "Revenue" in sales_perf.columns else 0.0
+
+    card_row = 4
+    _kpi_card(ws, card_row, 1, "Total Karyawan", str(total_emp))
+    _kpi_card(ws, card_row, 3, "Avg Attendance Score", f"{avg_score:.1f}%")
+    _kpi_card(ws, card_row, 5, "Total Kejadian Telat", str(total_late))
+    _kpi_card(ws, card_row, 7, "Total Kejadian Mangkir", str(total_absent))
+    _kpi_card(ws, card_row, 9, "Total SPK Sales", str(total_spk))
+    _kpi_card(ws, card_row, 11, "Total Delivery Sales", str(total_delivery))
+
+    # Automated HR Insights section
+    insight_row = 8
+    _section_title(ws, insight_row, 1, "Rangkuman Insight Otomatis (HR & Sales Highlights)", span=11)
+    ws.row_dimensions[insight_row].height = 20
+    for idx, text in enumerate(data.insights, start=1):
+        r = insight_row + idx
+        c = ws.cell(row=r, column=1, value=f"\u2022 {text}")
+        c.font = INSIGHT_FONT
+        c.alignment = Alignment(vertical="center")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=11)
+
+    # Tables: Watchlist (top anomalies) + Sales Leaderboard
+    table_start_row = insight_row + len(data.insights) + 2
+
+    # Watchlist: 5 lowest Attendance_Score
+    _section_title(ws, table_start_row, 1, "Perhatian Khusus: 5 Karyawan Skor Terendah", span=5)
+    watch_cols = ["No.", "Name", "Department", "Attendance_Score", "Terlambat", "Mangkir"]
+    avail_watch = [c for c in watch_cols if c in summary.columns] if not summary.is_empty() else []
+    watch = summary.sort("Attendance_Score").head(5).select(avail_watch) if avail_watch else pl.DataFrame()
+    row = table_start_row + 1
+    last_row, last_col = _write_table(ws, watch, start_row=row, start_col=1)
+
+    # Top 5 Sales
+    sales_col = 7
+    _section_title(ws, table_start_row, sales_col, "Top Performa Sales", span=5)
+    sales_cols = ["No.", "Name", "SPK", "Delivery", "Performance_Score"]
+    avail_sales = [c for c in sales_cols if c in sales_perf.columns] if not sales_perf.is_empty() else []
+    top_sales = sales_perf.sort("Performance_Score", descending=True).head(5).select(avail_sales) if avail_sales else pl.DataFrame()
+    sales_row = table_start_row + 1
+    _write_table(ws, top_sales, start_row=sales_row, start_col=sales_col)
+
+    # Daily Trend Chart
+    trend = data.daily_trend
+    if not trend.is_empty():
+        chart_section_row = max(last_row, sales_row + len(top_sales)) + 3
+        _section_title(ws, chart_section_row, 1, "Trend Kehadiran Harian", span=11)
+        data_start = chart_section_row + 1
+        trend_cols = ["Tanggal", "Work_Days", "Present", "Late", "Absent", "Early_Leave"]
+        avail_trend = [c for c in trend_cols if c in trend.columns]
+        _write_table(ws, trend.select(avail_trend), start_row=data_start, start_col=1)
+
+        # Line chart for Trend
+        n = len(trend)
+        chart = LineChart()
+        chart.title = "Trend Hadir vs Terlambat vs Mangkir"
+        chart.style = 13
+        chart.y_axis.title = "Jumlah Orang"
+        chart.x_axis.title = "Tanggal"
+        chart.height = 12
+        chart.width = 22
+
+        cats = Reference(ws, min_col=1, min_row=data_start + 1, max_row=data_start + n)
+        vals = Reference(ws, min_col=3, max_col=min(5, len(avail_trend)), min_row=data_start, max_row=data_start + n)
+        chart.add_data(vals, titles_from_data=True)
+        chart.set_categories(cats)
+        ws.add_chart(chart, f"G{data_start}")
+
+        # Bar chart for Late vs Absent
+        bar = BarChart()
+        bar.type = "col"
+        bar.title = "Perbandingan Terlambat vs Mangkir"
+        bar.height = 8
+        bar.width = 22
+        vals2 = Reference(ws, min_col=4, max_col=5, min_row=data_start, max_row=data_start + n)
+        bar.add_data(vals2, titles_from_data=True)
+        bar.set_categories(cats)
+        ws.add_chart(bar, f"G{data_start + 17}")
+
+    dept_summary = data.department_summary
+    if not dept_summary.is_empty():
+        dept_chart_row = data_start + len(trend) + 35
+        _section_title(ws, dept_chart_row, 1, "Attendance Score per Departemen")
+        dept_data_row = dept_chart_row + 1
+        dept_cols = ["Department", "Attendance_Score_%"]
+        avail_dept = [c for c in dept_cols if c in dept_summary.columns]
+        _write_table(
+            ws,
+            dept_summary.select(avail_dept),
+            start_row=dept_data_row,
+            start_col=1,
+        )
+        n = len(dept_summary)
+        dept_bar = BarChart()
+        dept_bar.type = "bar"
+        dept_bar.title = "Attendance Score per Departemen"
+        dept_bar.height = 8
+        dept_bar.width = 22
+        cats = Reference(ws, min_col=1, min_row=dept_data_row + 1, max_row=dept_data_row + n)
+        vals = Reference(ws, min_col=2, min_row=dept_data_row, max_row=dept_data_row + n)
+        dept_bar.add_data(vals, titles_from_data=True)
+        dept_bar.set_categories(cats)
+        ws.add_chart(dept_bar, f"G{dept_data_row}")
+
+    _autofit(ws, max_scan_row=30)
+
+
+# ---------------------------------------------------------------------------
+# README / Metadata Sheet
+# ---------------------------------------------------------------------------
+
+
+README_ROWS = [
+    ("LEMBAR DOKUMENTASI & METADATA LAPORAN", ""),
+    ("Tujuan Laporan", "Rekapitulasi kehadiran karyawan, evaluasi kedisiplinan, analisis performa sales, dan payroll."),
+    ("Format & Standar", "Dihasilkan secara otomatis oleh sistem HR Dashboard terstandar."),
+    ("", ""),
+    ("STRUKTUR SHEET", ""),
+    ("DASHBOARD", "Ringkasan visual eksekutif: KPI utama, watchlist kedisiplinan, leaderboard sales, dan grafik."),
+    ("CONFIG", "Snapshot konfigurasi aturan absensi, toleransi telat, bobot KPI sales, dan tarif potongan payroll."),
+    ("EMPLOYEE_MASTER", "Master data karyawan aktif: ID, Nama, Divisi, Jabatan, Tipe (OFFICE/SALES), Gaji Pokok."),
+    ("RAW_LOG", "Transaksi mentah dari mesin absensi setelah validasi dasar. Tidak diubah/dihapus (audit trail)."),
+    ("DAILY_ATTENDANCE", "Hasil perhitungan harian per karyawan: scan pertama/terakhir, status, menit telat, lembur, anomali."),
+    ("EMPLOYEE_SUMMARY", "KPI kehadiran per karyawan: attendance rate, punctuality, attendance score, tidak absen pulang, lembur."),
+    ("ANOMALY", "Hanya baris dengan anomali (severity HIGH/LOW, lupa scan pulang, scan hari libur) untuk ditelusuri HR."),
+    ("PAYROLL", "Estimasi potongan gaji: telat (per menit/kejadian), mangkir, dan potongan 1x tidak absen pulang khusus tim Sales."),
+    ("SALES_PERFORMANCE", "KPI dan skor performa sales, dihitung HANYA dari Sales_Activity — bukan dari fingerprint."),
+    ("Sales_Activity", "Input aktivitas sales (prospect, visit, test drive, SPK, delivery, revenue) per tanggal."),
+    ("", ""),
+    ("CATATAN PENTING", ""),
+    (
+        "Aturan First/Last Scan",
+        "Scan pertama = absen masuk, scan terakhir = absen pulang. Scan di antaranya TIDAK ditafsirkan "
+        "sebagai istirahat/keluar-masuk kantor, dicatat sebagai potensi anomali untuk audit.",
+    ),
+    (
+        "Sales & Canvassing",
+        "Mesin absensi tidak mencatat aktivitas canvassing sales. Jumlah scan TIDAK digunakan sebagai KPI sales. "
+        "Performa sales murni berasal dari sheet Sales_Activity.",
+    ),
+    (
+        "Data Ditolak",
+        "Baris raw yang tidak valid (ID kosong / tanggal tidak terbaca) tidak dihitung tetapi tetap disimpan "
+        "terpisah untuk audit (lihat sheet Data_Ditolak jika ada).",
+    ),
+]
+
+
+def _build_readme(wb: Workbook) -> None:
+    ws = wb.create_sheet("README")
+    ws.sheet_view.showGridLines = False
+    for i, (label, desc) in enumerate(README_ROWS, start=1):
+        c1 = ws.cell(row=i, column=1, value=label)
+        c2 = ws.cell(row=i, column=2, value=desc)
+        if desc == "" and label:
+            c1.font = Font(bold=True, size=13, color=WHITE)
+            c1.fill = PatternFill("solid", fgColor=NAVY)
+            ws.merge_cells(start_row=i, start_column=1, end_row=i, end_column=2)
+        else:
+            c1.font = Font(bold=True, color=NAVY)
+            c2.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 110
+
+
+# ---------------------------------------------------------------------------
+# Public entrypoint
+# ---------------------------------------------------------------------------
+
+
+def generate_workbook(data: ReportData) -> bytes:
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    _build_dashboard(wb, data)
+    _data_sheet(wb, "CONFIG", config_to_dataframe(data.config))
+    _data_sheet(wb, "EMPLOYEE_MASTER", data.employee_master)
+    _data_sheet(wb, "RAW_LOG", data.raw_log)
+    _data_sheet(wb, "DAILY_ATTENDANCE", data.daily_attendance)
+    _data_sheet(wb, "EMPLOYEE_SUMMARY", data.employee_summary)
+    _data_sheet(wb, "ANOMALY", data.anomalies)
+    _data_sheet(wb, "PAYROLL", data.payroll)
+    _data_sheet(wb, "SALES_PERFORMANCE", data.sales_performance)
+    _data_sheet(wb, "Sales_Activity", data.sales_activity)
+    if data.rejected is not None and not data.rejected.is_empty():
+        _data_sheet(wb, "Data_Ditolak", data.rejected)
+    _build_readme(wb)
+
+    for ws in wb.worksheets:
+        if ws.title != "DASHBOARD":
+            ws.freeze_panes = ws.freeze_panes or "A2"
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+</file>
+
+<file path="src/reporting/payslip.py">
+"""
+Payslip (Slip Gaji) generator for individual and bulk export in PDF and Excel formats.
+Layout strictly designed after the professional Indonesian standard payslip specification.
+"""
+
+from __future__ import annotations
+
+import io
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+from application.payroll import PayslipData
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, portrait
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import HRFlowable, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+
+NAVY_HEX = "#1F4E78"
+HEADER_BG_HEX = "#D9D9D9"
+BORDER_GRAY_HEX = "#B0B0B0"
+LIGHT_BG_HEX = "#F7F9FB"
+
+NAVY_EXCEL = "1F4E78"
+HEADER_BG_EXCEL = "D9D9D9"
+BORDER_GRAY_EXCEL = "B0B0B0"
+LIGHT_BG_EXCEL = "EBF1F5"
+
+FONT_NAME = "Segoe UI"
+
+
+def _fmt_currency(val: float) -> str:
+    if val is None:
+        return "0"
+    return f"{val:,.0f}"
+
+
+# ---------------------------------------------------------------------------
+# PDF Generator (ReportLab)
+# ---------------------------------------------------------------------------
+
+
+def _build_payslip_flowables(slip: PayslipData, company_info: dict) -> list:
+    """Build the flowable elements for a single payslip."""
+    company_name = company_info.get("name", "PT. Dealership Maju Bersama")
+    company_address = company_info.get("address", "Surabaya, Indonesia")
+
+    styles = getSampleStyleSheet()
+
+    # Title & Meta styles
+    style_title = ParagraphStyle(
+        "PayslipTitle",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=22,
+        leading=26,
+        alignment=2,  # Right align
+        textColor=colors.HexColor("#1A1A1A"),
+    )
+    style_company = ParagraphStyle(
+        "CompanyHeader",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=11,
+        leading=14,
+        textColor=colors.HexColor("#1F4E78"),
+    )
+    style_address = ParagraphStyle(
+        "CompanyAddress",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#595959"),
+    )
+    style_meta_label = ParagraphStyle(
+        "MetaLabel",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#333333"),
+    )
+    style_meta_val = ParagraphStyle(
+        "MetaValue",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#1A1A1A"),
+    )
+    style_sec_head = ParagraphStyle(
+        "SectionHead",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=10,
+        leading=12,
+        textColor=colors.HexColor("#1A1A1A"),
+    )
+    style_cell_left = ParagraphStyle(
+        "CellLeft",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#1A1A1A"),
+    )
+    style_cell_right = ParagraphStyle(
+        "CellRight",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        alignment=2,
+        textColor=colors.HexColor("#1A1A1A"),
+    )
+    style_cell_bold_right = ParagraphStyle(
+        "CellBoldRight",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=9,
+        leading=11,
+        alignment=2,
+        textColor=colors.HexColor("#1A1A1A"),
+    )
+    style_cell_bold_left = ParagraphStyle(
+        "CellBoldLeft",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=9,
+        leading=11,
+        textColor=colors.HexColor("#1A1A1A"),
+    )
+
+    flowables = []
+
+    # 1. Header: Company Info on Left, "Slip Gaji" on Right
+    header_data = [
+        [
+            Paragraph(f"<b>{company_name}</b><br/>{company_address}", style_company),
+            Paragraph("<b>Slip Gaji</b>", style_title),
+        ]
+    ]
+    t_header = Table(header_data, colWidths=[110 * mm, 70 * mm])
+    t_header.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    flowables.append(t_header)
+    flowables.append(Spacer(1, 3 * mm))
+
+    # 2. Employee Metadata Bar (2 Columns of Key-Values)
+    meta_data = [
+        [
+            Paragraph("Nama / NIK", style_meta_label),
+            Paragraph(f": {slip.name} ({slip.employee_id})", style_meta_val),
+            Paragraph("Tgl Mulai Bekerja", style_meta_label),
+            Paragraph(f": {slip.join_date}", style_meta_val),
+        ],
+        [
+            Paragraph("Dept / Jabatan", style_meta_label),
+            Paragraph(f": {slip.department} / {slip.position}", style_meta_val),
+            Paragraph("Periode Gaji", style_meta_label),
+            Paragraph(f": {slip.period_label or '-'}", style_meta_val),
+        ],
+    ]
+    t_meta = Table(meta_data, colWidths=[28 * mm, 62 * mm, 32 * mm, 58 * mm])
+    t_meta.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 1),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+            ]
+        )
+    )
+    flowables.append(t_meta)
+    flowables.append(Spacer(1, 4 * mm))
+
+    # 3. Financial Table (Pendapatan vs Potongan in 2 Columns)
+    pendapatan_rows = [
+        ("Gaji Pokok", _fmt_currency(slip.gaji_pokok)),
+        ("Lembur", _fmt_currency(slip.lembur_pay)),
+        ("Tunjangan Jabatan", _fmt_currency(slip.tunjangan_jabatan)),
+        ("Uang Makan", _fmt_currency(slip.uang_makan)),
+        ("Tunjangan Parkir / Transport", _fmt_currency(slip.tunjangan_transport)),
+    ]
+    potongan_rows = [
+        ("Potongan Absen (Mangkir)", _fmt_currency(slip.potongan_mangkir)),
+        ("Potongan Datang Terlambat", _fmt_currency(slip.potongan_telat)),
+        ("Potongan Pulang Lebih Dulu", _fmt_currency(slip.potongan_pulang_cepat)),
+        ("Potongan Lupa Absen Pulang (Sales)", _fmt_currency(slip.potongan_lupa_pulang_sales)),
+        ("Potongan Lain-lain", _fmt_currency(slip.potongan_lain)),
+    ]
+
+    max_rows = max(len(pendapatan_rows), len(potongan_rows))
+
+    fin_table_data = [
+        [
+            Paragraph("<b>Pendapatan</b>", style_sec_head),
+            "",
+            Paragraph("<b>Potongan</b>", style_sec_head),
+            "",
+        ]
+    ]
+
+    for i in range(max_rows):
+        p_label, p_val = pendapatan_rows[i] if i < len(pendapatan_rows) else ("", "")
+        d_label, d_val = potongan_rows[i] if i < len(potongan_rows) else ("", "")
+        fin_table_data.append(
+            [
+                Paragraph(p_label, style_cell_left),
+                Paragraph(p_val, style_cell_right),
+                Paragraph(d_label, style_cell_left),
+                Paragraph(d_val, style_cell_right),
+            ]
+        )
+
+    # Total row
+    fin_table_data.append(
+        [
+            Paragraph("<b>Total Pendapatan</b>", style_cell_bold_left),
+            Paragraph(f"<b>{_fmt_currency(slip.total_pendapatan)}</b>", style_cell_bold_right),
+            Paragraph("<b>Total Potongan</b>", style_cell_bold_left),
+            Paragraph(f"<b>{_fmt_currency(slip.total_potongan)}</b>", style_cell_bold_right),
+        ]
+    )
+
+    t_fin = Table(fin_table_data, colWidths=[55 * mm, 35 * mm, 55 * mm, 35 * mm])
+    t_fin.setStyle(
+        TableStyle(
+            [
+                # Header row styling (Gray fill)
+                ("BACKGROUND", (0, 0), (1, 0), colors.HexColor(HEADER_BG_HEX)),
+                ("BACKGROUND", (2, 0), (3, 0), colors.HexColor(HEADER_BG_HEX)),
+                ("SPAN", (0, 0), (1, 0)),
+                ("SPAN", (2, 0), (3, 0)),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                # Total row border
+                ("LINEABOVE", (0, -1), (-1, -1), 1.2, colors.HexColor("#333333")),
+                ("LINEBELOW", (0, -1), (-1, -1), 1.2, colors.HexColor("#333333")),
+                ("BOTTOMPADDING", (0, -1), (-1, -1), 5),
+                ("TOPPADDING", (0, -1), (-1, -1), 5),
+            ]
+        )
+    )
+    flowables.append(t_fin)
+    flowables.append(Spacer(1, 3 * mm))
+
+    # 4. Take Home Pay Banner
+    thp_data = [
+        [
+            Paragraph("<b>Gaji Bersih / Take Home Pay</b>", style_sec_head),
+            Paragraph(f"<b>Rp {_fmt_currency(slip.take_home_pay)}</b>", style_title),
+        ]
+    ]
+    t_thp = Table(thp_data, colWidths=[90 * mm, 90 * mm])
+    t_thp.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#EBF1F5")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#1F4E78")),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    flowables.append(t_thp)
+    flowables.append(Spacer(1, 4 * mm))
+
+    # 5. Rangkuman Informasi Kehadiran
+    att_head = [
+        [
+            Paragraph("<b>Rangkuman Informasi Kehadiran</b>", style_sec_head),
+            "",
+            "",
+            "",
+        ]
+    ]
+    att_rows = [
+        ("Kehadiran", f"{slip.hari_kehadiran} Hari", "Terlambat", f"{slip.kali_terlambat} Kali ({slip.menit_terlambat} Menit)"),
+        ("Ketidak Hadiran (Mangkir)", f"{slip.hari_mangkir} Hari", "Pulang Lebih Dulu", f"{slip.kali_pulang_cepat} Kali"),
+        ("Cuti", f"{slip.hari_cuti} Hari", "Lupa Absen", f"{slip.kali_lupa_absen} Kali"),
+        ("Izin", f"{slip.hari_izin} Hari", "Total Jam Lembur", f"{slip.total_jam_lembur:.1f} Jam"),
+        ("Sakit", f"{slip.hari_sakit} Hari", "", ""),
+    ]
+
+    att_table_data = att_head
+    for r in att_rows:
+        att_table_data.append(
+            [
+                Paragraph(r[0], style_cell_left),
+                Paragraph(r[1], style_cell_right),
+                Paragraph(r[2], style_cell_left),
+                Paragraph(r[3], style_cell_right),
+            ]
+        )
+
+    t_att = Table(att_table_data, colWidths=[50 * mm, 40 * mm, 50 * mm, 40 * mm])
+    t_att.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(HEADER_BG_HEX)),
+                ("SPAN", (0, 0), (-1, 0)),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LINEBELOW", (0, -1), (-1, -1), 0.5, colors.HexColor(BORDER_GRAY_HEX)),
+            ]
+        )
+    )
+    flowables.append(t_att)
+
+    return flowables
+
+
+def generate_payslip_pdf(slip: PayslipData, company_info: dict) -> bytes:
+    """Generate a single employee payslip as a PDF document."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=portrait(A4),
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+    )
+    flowables = _build_payslip_flowables(slip, company_info)
+    doc.build(flowables)
+    return buffer.getvalue()
+
+
+def generate_bulk_payslip_pdf(slips: list[PayslipData], company_info: dict) -> bytes:
+    """Generate a multi-page PDF document containing all employee payslips (1 slip per page)."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=portrait(A4),
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+    )
+    all_flowables = []
+    for idx, slip in enumerate(slips):
+        slip_flowables = _build_payslip_flowables(slip, company_info)
+        all_flowables.extend(slip_flowables)
+        if idx < len(slips) - 1:
+            all_flowables.append(PageBreak())
+
+    doc.build(all_flowables)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Excel Generator (OpenPyXL)
+# ---------------------------------------------------------------------------
+
+
+def _populate_excel_payslip_sheet(ws, slip: PayslipData, company_info: dict) -> None:
+    """Populate an openpyxl Worksheet with a beautifully formatted payslip."""
+    company_name = company_info.get("name", "PT. Dealership Maju Bersama")
+    company_address = company_info.get("address", "Surabaya, Indonesia")
+
+    ws.sheet_view.showGridLines = False
+
+    font_title = Font(name=FONT_NAME, size=18, bold=True, color="1A1A1A")
+    font_company = Font(name=FONT_NAME, size=11, bold=True, color=NAVY_EXCEL)
+    font_address = Font(name=FONT_NAME, size=9, color="595959")
+    font_meta_lbl = Font(name=FONT_NAME, size=9, bold=True, color="333333")
+    font_meta_val = Font(name=FONT_NAME, size=9, color="1A1A1A")
+    font_head = Font(name=FONT_NAME, size=10, bold=True, color="1A1A1A")
+    font_bold = Font(name=FONT_NAME, size=10, bold=True, color="1A1A1A")
+    font_regular = Font(name=FONT_NAME, size=9, color="1A1A1A")
+    font_thp_lbl = Font(name=FONT_NAME, size=11, bold=True, color=NAVY_EXCEL)
+    font_thp_val = Font(name=FONT_NAME, size=14, bold=True, color=NAVY_EXCEL)
+
+    fill_gray_head = PatternFill("solid", fgColor=HEADER_BG_EXCEL)
+    fill_thp = PatternFill("solid", fgColor=LIGHT_BG_EXCEL)
+
+    thin_border = Side(style="thin", color=BORDER_GRAY_EXCEL)
+    border_full = Border(left=thin_border, right=thin_border, top=thin_border, bottom=thin_border)
+    border_top_bottom = Border(top=thin_border, bottom=thin_border)
+
+    # 1. Company Header & Title
+    ws["A1"] = company_name
+    ws["A1"].font = font_company
+    ws["A2"] = company_address
+    ws["A2"].font = font_address
+
+    ws["D1"] = "Slip Gaji"
+    ws["D1"].font = font_title
+    ws["D1"].alignment = Alignment(horizontal="right")
+    ws.merge_cells("D1:E1")
+
+    # 2. Metadata
+    ws["A4"] = "Nama / NIK"
+    ws["A4"].font = font_meta_lbl
+    ws["B4"] = f"{slip.name} ({slip.employee_id})"
+    ws["B4"].font = font_meta_val
+
+    ws["D4"] = "Tgl Mulai Bekerja"
+    ws["D4"].font = font_meta_lbl
+    ws["E4"] = slip.join_date
+    ws["E4"].font = font_meta_val
+
+    ws["A5"] = "Dept / Jabatan"
+    ws["A5"].font = font_meta_lbl
+    ws["B5"] = f"{slip.department} / {slip.position}"
+    ws["B5"].font = font_meta_val
+
+    ws["D5"] = "Periode Gaji"
+    ws["D5"].font = font_meta_lbl
+    ws["E5"] = slip.period_label or "-"
+    ws["E5"].font = font_meta_val
+
+    # 3. Financial Table Header
+    ws["A7"] = "Pendapatan"
+    ws["A7"].font = font_head
+    ws["A7"].fill = fill_gray_head
+    ws.merge_cells("A7:B7")
+
+    ws["D7"] = "Potongan"
+    ws["D7"].font = font_head
+    ws["D7"].fill = fill_gray_head
+    ws.merge_cells("D7:E7")
+
+    # Financial Rows
+    p_rows = [
+        ("Gaji Pokok", slip.gaji_pokok),
+        ("Lembur", slip.lembur_pay),
+        ("Tunjangan Jabatan", slip.tunjangan_jabatan),
+        ("Uang Makan", slip.uang_makan),
+        ("Tunjangan Parkir / Transport", slip.tunjangan_transport),
+    ]
+    d_rows = [
+        ("Potongan Absen (Mangkir)", slip.potongan_mangkir),
+        ("Potongan Datang Terlambat", slip.potongan_telat),
+        ("Potongan Pulang Lebih Dulu", slip.potongan_pulang_cepat),
+        ("Potongan Lupa Absen Pulang (Sales)", slip.potongan_lupa_pulang_sales),
+        ("Potongan Lain-lain", slip.potongan_lain),
+    ]
+
+    for i in range(max(len(p_rows), len(d_rows))):
+        r_idx = 8 + i
+        if i < len(p_rows):
+            ws[f"A{r_idx}"] = p_rows[i][0]
+            ws[f"A{r_idx}"].font = font_regular
+            ws[f"B{r_idx}"] = p_rows[i][1]
+            ws[f"B{r_idx}"].font = font_regular
+            ws[f"B{r_idx}"].number_format = "#,##0"
+        if i < len(d_rows):
+            ws[f"D{r_idx}"] = d_rows[i][0]
+            ws[f"D{r_idx}"].font = font_regular
+            ws[f"E{r_idx}"] = d_rows[i][1]
+            ws[f"E{r_idx}"].font = font_regular
+            ws[f"E{r_idx}"].number_format = "#,##0"
+
+    tot_row = 8 + max(len(p_rows), len(d_rows))
+    ws[f"A{tot_row}"] = "Total Pendapatan"
+    ws[f"A{tot_row}"].font = font_bold
+    ws[f"B{tot_row}"] = slip.total_pendapatan
+    ws[f"B{tot_row}"].font = font_bold
+    ws[f"B{tot_row}"].number_format = "#,##0"
+
+    ws[f"D{tot_row}"] = "Total Potongan"
+    ws[f"D{tot_row}"].font = font_bold
+    ws[f"E{tot_row}"] = slip.total_potongan
+    ws[f"E{tot_row}"].font = font_bold
+    ws[f"E{tot_row}"].number_format = "#,##0"
+
+    for col in ["A", "B", "D", "E"]:
+        ws[f"{col}{tot_row}"].border = border_top_bottom
+
+    # 4. Take Home Pay Row
+    thp_row = tot_row + 2
+    ws[f"A{thp_row}"] = "Gaji Bersih / Take Home Pay"
+    ws[f"A{thp_row}"].font = font_thp_lbl
+    ws[f"A{thp_row}"].fill = fill_thp
+    ws.merge_cells(f"A{thp_row}:C{thp_row}")
+
+    ws[f"D{thp_row}"] = slip.take_home_pay
+    ws[f"D{thp_row}"].font = font_thp_val
+    ws[f"D{thp_row}"].fill = fill_thp
+    ws[f"D{thp_row}"].number_format = '"Rp " #,##0'
+    ws.merge_cells(f"D{thp_row}:E{thp_row}")
+
+    # 5. Rangkuman Informasi Kehadiran
+    att_head_row = thp_row + 2
+    ws[f"A{att_head_row}"] = "Rangkuman Informasi Kehadiran"
+    ws[f"A{att_head_row}"].font = font_head
+    ws[f"A{att_head_row}"].fill = fill_gray_head
+    ws.merge_cells(f"A{att_head_row}:E{att_head_row}")
+
+    att_data = [
+        ("Kehadiran", f"{slip.hari_kehadiran} Hari", "Terlambat", f"{slip.kali_terlambat} Kali ({slip.menit_terlambat} Menit)"),
+        ("Ketidak Hadiran (Mangkir)", f"{slip.hari_mangkir} Hari", "Pulang Lebih Dulu", f"{slip.kali_pulang_cepat} Kali"),
+        ("Cuti", f"{slip.hari_cuti} Hari", "Lupa Absen", f"{slip.kali_lupa_absen} Kali"),
+        ("Izin", f"{slip.hari_izin} Hari", "Total Jam Lembur", f"{slip.total_jam_lembur:.1f} Jam"),
+        ("Sakit", f"{slip.hari_sakit} Hari", "", ""),
+    ]
+
+    for idx, row in enumerate(att_data, start=att_head_row + 1):
+        ws[f"A{idx}"] = row[0]
+        ws[f"A{idx}"].font = font_regular
+        ws[f"B{idx}"] = row[1]
+        ws[f"B{idx}"].font = font_regular
+        ws[f"B{idx}"].alignment = Alignment(horizontal="right")
+
+        ws[f"D{idx}"] = row[2]
+        ws[f"D{idx}"].font = font_regular
+        ws[f"E{idx}"] = row[3]
+        ws[f"E{idx}"].font = font_regular
+        ws[f"E{idx}"].alignment = Alignment(horizontal="right")
+
+    # Column Widths
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 4
+    ws.column_dimensions["D"].width = 28
+    ws.column_dimensions["E"].width = 20
+
+
+def generate_payslip_excel(slip: PayslipData, company_info: dict) -> bytes:
+    """Generate a single employee payslip as an Excel spreadsheet."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Slip_{slip.employee_id}"
+    _populate_excel_payslip_sheet(ws, slip, company_info)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def generate_bulk_payslip_excel(slips: list[PayslipData], company_info: dict) -> bytes:
+    """Generate a consolidated Excel workbook with 1 sheet per employee payslip."""
+    wb = Workbook()
+    wb.remove(wb.active)  # Remove default active sheet
+
+    for slip in slips:
+        # Sheet title max 31 chars
+        clean_name = "".join(c for c in slip.name if c.isalnum() or c in " _-")[:18].strip()
+        sheet_title = f"{slip.employee_id}_{clean_name}"[:31]
+        ws = wb.create_sheet(title=sheet_title)
+        _populate_excel_payslip_sheet(ws, slip, company_info)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+</file>
+
+<file path="src/services/file_engine.py">
+from __future__ import annotations
+
+"""Spreadsheet/file input engine used by the HR dashboard.
+
+All user-uploaded tabular files are normalized through this module.
+
+Supported extensions:
+    .xlsx
+    .xls
+    .csv
+"""
+
+import io
+import warnings
+from pathlib import Path
+from typing import Any
+
+import polars as pl
+
+SUPPORTED_EXTENSIONS = (".xlsx", ".xls", ".csv")
+
+
+class UnsupportedFileTypeError(ValueError):
+    """Raised when an uploaded file has an unsupported extension."""
+
+
+def extension_of(filename: str | None) -> str:
+    """Return the lowercase file extension."""
+    return Path(filename or "").suffix.lower()
+
+
+def validate_extension(filename: str | None) -> str:
+    """Validate and return the uploaded file extension."""
+    ext = extension_of(filename)
+
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise UnsupportedFileTypeError(
+            f"Format file '{ext or '(tanpa ekstensi)'}' tidak didukung. "
+            f"Gunakan {', '.join(SUPPORTED_EXTENSIONS)}."
+        )
+
+    return ext
+
+
+def _read_excel(file_bytes: bytes, **kwargs: Any) -> Any:
+    """Read Excel bytes using Polars + Calamine.
+
+    Polars currently emits a FutureWarning from its internal
+    Arrow conversion path with some fastexcel/pyarrow combinations.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=FutureWarning)
+
+        return pl.read_excel(
+            io.BytesIO(file_bytes),
+            engine="calamine",
+            **kwargs,
+        )
+
+
+def _normalize_dataframe(value: Any) -> pl.DataFrame:
+    """Guarantee that an Excel result is a Polars DataFrame."""
+    if isinstance(value, pl.DataFrame):
+        return value
+
+    return pl.DataFrame(value)
+
+
+def read_table(
+    file_bytes: bytes,
+    filename: str | None,
+) -> pl.DataFrame:
+    """Read one uploaded tabular file into a Polars DataFrame."""
+    ext = validate_extension(filename)
+
+    # CSV
+    if ext == ".csv":
+        try:
+            return pl.read_csv(
+                io.BytesIO(file_bytes),
+                infer_schema_length=1000,
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Gagal membaca {filename or 'file CSV'}: {exc}"
+            ) from exc
+
+    # XLS / XLSX
+    try:
+        result = _read_excel(file_bytes)
+
+        return _normalize_dataframe(result)
+
+    except Exception as exc:
+        raise ValueError(
+            f"Gagal membaca {filename or 'file Excel'}: {exc}"
+        ) from exc
+
+
+def read_workbook_sheets(
+    file_bytes: bytes,
+    filename: str | None,
+) -> dict[str, pl.DataFrame]:
+    """Read all sheets from an Excel workbook.
+
+    For CSV:
+        Returns one sheet named ``Sheet1``.
+
+    For Excel:
+        Returns a dictionary containing sheet names and
+        Polars DataFrames.
+    """
+    ext = validate_extension(filename)
+
+    # CSV has no workbook/sheet concept.
+    if ext == ".csv":
+        return {
+            "Sheet1": read_table(
+                file_bytes,
+                filename,
+            )
+        }
+
+    # XLS / XLSX
+    try:
+        sheets: Any = _read_excel(
+            file_bytes,
+            sheet_id=0,
+        )
+
+        # Polars returned a single DataFrame.
+        if isinstance(sheets, pl.DataFrame):
+            return {
+                "Sheet1": sheets
+            }
+
+        # Polars returned multiple sheets.
+        if isinstance(sheets, dict):
+            return {
+                str(sheet_name): _normalize_dataframe(sheet_data)
+                for sheet_name, sheet_data in sheets.items()
+            }
+
+        # Defensive fallback.
+        return {
+            "Sheet1": _normalize_dataframe(sheets)
+        }
+
+    except Exception as exc:
+        raise ValueError(
+            f"Gagal membaca workbook "
+            f"{filename or 'file Excel'}: {exc}"
+        ) from exc
+</file>
+
+<file path="src/services/models.py">
+from dataclasses import dataclass
+from datetime import date
+from typing import Any
+
+import polars as pl
+
+from application.config import AppConfig
+
+
+@dataclass(frozen=True)
+class UploadedFile:
+    content: bytes
+    filename: str
+
+
+@dataclass(frozen=True)
+class PipelineRequest:
+    attendance: UploadedFile
+    master: UploadedFile | None
+    leave: UploadedFile | None
+    sales: UploadedFile | None
+    config: AppConfig
+    holidays: frozenset[date]
+    overtime_hourly_rate: float = 0.0
+
+
+@dataclass
+class PipelineResult:
+    config: AppConfig
+    clean: pl.DataFrame
+    rejected: pl.DataFrame
+    quality: dict[str, Any]
+    master: pl.DataFrame
+    unmapped: pl.DataFrame
+    daily: pl.DataFrame
+    employee_summary: pl.DataFrame
+    department_summary: pl.DataFrame
+    trend: pl.DataFrame
+    anomalies: pl.DataFrame
+    insights: list[str]
+    payroll: pl.DataFrame
+    sales_activity: pl.DataFrame
+    sales_performance: pl.DataFrame
+    combined_view: pl.DataFrame
+    payslips: list[Any]
+    period_label: str
+</file>
+
+<file path="src/services/pipeline.py">
+from __future__ import annotations
+
+from datetime import date, datetime, time
+from typing import Optional
+
+import polars as pl
+
+from attendance import analytics as att_analytics
+from attendance import engine as att_engine
+from attendance.parser import AttendanceValidationError, clean_approved_leave, clean_attendance_data
+from services.file_engine import read_table
+from application.config import AppConfig, AttendanceConfig, PayrollConfig, ScoreConfig, SalesScoreConfig
+from application.employee_master import load_employee_master, merge_master_into_log
+from application.leave import load_leave_workbook
+from application.payroll import build_payslip_records, calculate_payroll
+from application.sales import calculate_sales_performance, clean_sales_activity, combine_attendance_and_sales
+
+
+def _read_upload(file_bytes: bytes, filename: str | None) -> pl.DataFrame:
+    return read_table(file_bytes, filename)
+
+
+def run_attendance_pipeline(
+    attendance_bytes: bytes,
+    attendance_name: str,
+    master_bytes: Optional[bytes],
+    leave_bytes: Optional[bytes],
+    master_name: str,
+    leave_name: str,
+    sales_bytes: Optional[bytes],
+    sales_name: str,
+    clock_in_str: str,
+    weekday_out_str: str,
+    saturday_out_str: str,
+    grace_minutes: int,
+    saturday_working: bool,
+    sunday_off: bool,
+    start_date_val: Optional[date],
+    end_date_val: Optional[date],
+    holidays_tuple: tuple[str, ...],
+    score_thresholds: tuple[float, float, float],
+    payroll_args: dict,
+    sales_weights: dict,
+    overtime_hourly_rate: float,
+) -> dict:
+    raw = _read_upload(attendance_bytes, attendance_name)
+    clean, rejected, quality = clean_attendance_data(raw)
+    if clean.is_empty():
+        raise AttendanceValidationError("Tidak ada baris valid setelah proses cleaning.")
+
+    master = pl.DataFrame()
+    if master_bytes:
+        master = load_employee_master(_read_upload(master_bytes, master_name))
+
+    enriched, unmapped = merge_master_into_log(clean, master)
+
+    leave_result = None
+    approved_leave = None
+    if leave_bytes:
+        if leave_name.lower().endswith(".csv"):
+            approved_leave = clean_approved_leave(_read_upload(leave_bytes, leave_name))
+        else:
+            from application.leave import load_leave_file
+            leave_result = load_leave_file(leave_bytes, leave_name)
+
+    holidays = set()
+    for line in holidays_tuple:
+        line = line.strip()
+        if line:
+            try:
+                holidays.add(datetime.strptime(line[:10], "%Y-%m-%d").date())
+            except ValueError:
+                pass
+
+    cfg = AppConfig(
+        attendance=AttendanceConfig(
+            clock_in=time.fromisoformat(clock_in_str),
+            weekday_clock_out=time.fromisoformat(weekday_out_str),
+            saturday_clock_out=time.fromisoformat(saturday_out_str),
+            grace_minutes=grace_minutes,
+            saturday_is_working=saturday_working,
+            sunday_is_off=sunday_off,
+            start_date=start_date_val,
+            end_date=end_date_val,
+        ),
+        score=ScoreConfig(
+            excellent_threshold=score_thresholds[0],
+            good_threshold=score_thresholds[1],
+            watch_threshold=score_thresholds[2],
+        ),
+        payroll=PayrollConfig(**payroll_args),
+        sales_score=SalesScoreConfig(**sales_weights),
+    )
+
+    daily = att_engine.build_daily_attendance(
+        enriched, cfg.attendance, holidays, approved_leave=approved_leave, leave_result=leave_result
+    )
+    employee_summary = att_analytics.calculate_employee_summary(daily, cfg.score)
+    department_summary = att_analytics.calculate_department_summary(daily)
+    trend = att_analytics.calculate_daily_trend(daily)
+    anomalies = daily.filter(pl.col("Is_Anomali") == 1) if not daily.is_empty() else pl.DataFrame()
+    insights = att_analytics.derive_hr_insights(employee_summary, department_summary)
+    payroll = calculate_payroll(employee_summary, master, cfg.payroll)
+
+    sales_activity = pl.DataFrame()
+    sales_performance = pl.DataFrame()
+    combined_view = pl.DataFrame()
+    if sales_bytes:
+        sales_raw = _read_upload(sales_bytes, sales_name)
+        sales_activity = clean_sales_activity(sales_raw)
+        sales_performance = calculate_sales_performance(sales_activity, master, cfg.sales_score)
+        combined_view = combine_attendance_and_sales(employee_summary, sales_performance)
+
+    period_label = ""
+    if not daily.is_empty() and "Tanggal" in daily.columns:
+        period_label = f"{daily['Tanggal'].min()} s/d {daily['Tanggal'].max()}"
+
+    payslip_records = build_payslip_records(
+        payroll,
+        employee_summary,
+        daily,
+        master,
+        overtime_hourly_rate=overtime_hourly_rate,
+        period_label=period_label,
+    )
+
+    return {
+        "cfg": cfg,
+        "clean": clean,
+        "rejected": rejected,
+        "quality": quality,
+        "master": master,
+        "unmapped": unmapped,
+        "daily": daily,
+        "employee_summary": employee_summary,
+        "department_summary": department_summary,
+        "trend": trend,
+        "anomalies": anomalies,
+        "insights": insights,
+        "payroll": payroll,
+        "sales_activity": sales_activity,
+        "sales_performance": sales_performance,
+        "combined_view": combined_view,
+        "payslips": payslip_records,
+        "period_label": period_label,
+    }
+</file>
+
+<file path="src/ui/page.py">
+import flet as ft
+
+from ui.state import FletDashboardState
+
+
+def build_page(page: ft.Page) -> None:
+    state = FletDashboardState(page)
+
+    page.add(
+        ft.Row(
+            controls=[
+                build_sidebar(state),
+                ft.VerticalDivider(width=1),
+                ft.Container(
+                    content=state.results_view,
+                    expand=True,
+                    padding=20,
+                ),
+            ],
+            expand=True,
+        )
+    )
+</file>
+
+<file path="src/ui/state.py">
+from __future__ import annotations
+
+import flet as ft
+
+from services.models import PipelineRequest, PipelineResult
+from services.pipeline import run_attendance_pipeline
+
+
+class FletDashboardState:
+    def __init__(self, page: ft.Page) -> None:
+        self.page = page
+        self.result: PipelineResult | None = None
+        self.error: str | None = None
+
+        self.status = ft.Text("Menunggu upload data...")
+        self.process_button = ft.ElevatedButton(
+            "Proses Data",
+            icon=ft.Icons.PLAY_ARROW,
+            on_click=self.process,
+        )
+        self.results_view = ft.Column(expand=True)
+
+    async def process(self, event: ft.ControlEvent) -> None:
+        self.process_button.disabled = True
+        self.status.value = "Memproses..."
+        self.page.update()
+
+        try:
+            request = self.build_request()
+            self.result = await self.run_pipeline(request)
+            self.status.value = "Selesai"
+            self.render_results()
+        except Exception as exc:
+            self.error = str(exc)
+            self.status.value = f"Error: {self.error}"
+        finally:
+            self.process_button.disabled = False
+            self.page.update()
+
+    async def run_pipeline(self, request: PipelineRequest):
+        # Run synchronous Polars/OpenPyXL work away from the UI event loop.
+        return await self.page.run_task(run_attendance_pipeline, request)
+
+    def build_request(self) -> PipelineRequest:
+        raise NotImplementedError
+
+    def render_results(self) -> None:
+        self.results_view.controls.clear()
+        if self.result is None:
+            return
+
+        self.results_view.controls.append(
+            ft.Text(
+                f"Periode: {self.result.period_label}",
+                size=20,
+                weight=ft.FontWeight.BOLD,
+            )
+        )
+        self.page.update()
+</file>
+
+<file path="src/main.py">
+import flet as ft
+
+from ui.page import build_page
+
+
+def main(page: ft.Page) -> None:
+    page.title = "HR Attendance, Payroll & Sales Dashboard"
+    page.theme_mode = ft.ThemeMode.LIGHT
+    page.padding = 0
+    build_page(page)
+
+
+if __name__ == "__main__":
+    ft.run(main)
+</file>
+
+<file path="tests/test_main.py">
+import flet.testing as ftt
+
+
+async def test_increment(flet_app: ftt.FletTestApp):
+    """Counter sample: tap the FAB and assert the counter goes 0 -> 1.
+
+    The `flet_app` fixture is provided automatically by the flet pytest plugin.
+    Run with `flet test` (or `uv run pytest`) from the project directory.
+    """
+    tester = flet_app.tester
+
+    await tester.pump_and_settle()
+
+    # Initial state
+    assert (await tester.find_by_text("0")).count == 1
+
+    # Tap the increment button (found by its key) and let the UI settle
+    await tester.tap(await tester.find_by_key("increment"))
+    await tester.pump_and_settle()
+
+    # New state
+    assert (await tester.find_by_text("1")).count == 1
+</file>
+
+<file path=".gitignore">
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environments / secrets
+.env
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Flet
+.flet/
+build/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+</file>
+
+<file path="architecture.md">
+src/
+  application/
+    config.py
+    employee_master.py
+    leave.py
+    payroll.py
+    sales.py
+
+  attendance/
+    parser.py
+    engine.py
+    analytics.py
+
+  services/
+    file_engine.py
+    pipeline.py
+    models.py              # new: PipelineRequest/PipelineResult
+
+  reporting/
+    excel_report.py
+    payslip.py
+
+  ui/
+    common/
+      formatters.py
+      view_models.py       # new
+    flet_app/
+      app.py               # new Flet entrypoint
+      page_state.py        # new
+      upload_panel.py
+      config_panel.py
+      results_view.py
+      tables.py
+      charts.py
+
+  hr_nicegui/              # temporary compatibility package
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "hrd-app"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Flet developer", email = "you@example.com" }
+]
+dependencies = [
+    "flet>=1.0.0",
+    "fastexcel>=0.21.0",
+    "openpyxl>=3.1.5",
+    "polars>=1.44.2",
+    "pyarrow>=25.0.1",
+    "reportlab>=5.0.1",
+    "xlsxwriter>=3.2.9",
+]
+
+[dependency-groups]
+dev = [
+    "flet-cli>=1.0.0",
+    "flet-desktop>=1.0.0",
+    "flet-web>=1.0.0",
+    # Integration testing with `flet test` / pytest. The `test` extra brings in
+    # pytest, pytest-asyncio and the screenshot-comparison dependencies.
+    "flet[test]>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/attendance",
+    "src/reporting",
+    "src/application",
+    "src/ui",
+    "src/services",
+]
+
+[tool.flet]
+org = "com.mycompany"
+product = "hrd-app"
+company = "Flet"
+copyright = "Copyright (C) 2023-2026 by Flet"
+
+# src/assets/icon.png is the icon for every platform. Keep it transparent and
+# filling the whole canvas: web, Windows and Linux show it as-is, and Flet
+# shrinks it to the margin iOS, macOS and Android each mask away. This colour
+# is what sits behind it where transparency cannot survive - the iOS icon, the
+# macOS tile and the Android background layer. Defaults to white.
+# icon_background = "#ffffff"
+
+[tool.flet.app]
+path = "src"
+</file>
+
+<file path="README.md">
+# HrdApp app
+
+## Run the app
+
+### uv
+
+Run as a desktop app:
+
+```bash
+uv run flet run
+```
+
+Run as a web app:
+
+```bash
+uv run flet run --web
+```
+
+For more details on running the app, refer to the [Getting Started Guide](https://flet.dev/docs/).
+
+## Build the app
+
+### Android
+
+```bash
+flet build apk -v
+```
+
+For more details on building and signing `.apk` or `.aab`, refer to the [Android Packaging Guide](https://flet.dev/docs/publish/android/).
+
+### iOS
+
+```bash
+flet build ipa -v
+```
+
+For more details on building and signing `.ipa`, refer to the [iOS Packaging Guide](https://flet.dev/docs/publish/ios/).
+
+### macOS
+
+```bash
+flet build macos -v
+```
+
+For more details on building macOS package, refer to the [macOS Packaging Guide](https://flet.dev/docs/publish/macos/).
+
+### Linux
+
+```bash
+flet build linux -v
+```
+
+For more details on building Linux package, refer to the [Linux Packaging Guide](https://flet.dev/docs/publish/linux/).
+
+### Windows
+
+```bash
+flet build windows -v
+```
+
+For more details on building Windows package, refer to the [Windows Packaging Guide](https://flet.dev/docs/publish/windows/).
+
+### Web
+
+```bash
+flet build web -v
+```
+
+For more details on building Web app, refer to the [Web Packaging Guide](https://flet.dev/docs/publish/web/).
+</file>
+
+</files>
