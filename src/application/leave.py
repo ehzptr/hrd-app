@@ -19,6 +19,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.datavalidation import DataValidation
 import polars as pl
 
+from reporting.excel_utils import style_guide_sheet, style_template_sheet
 from services.file_engine import read_workbook_sheets, extension_of, validate_extension
 
 NAVY = "1F4E78"
@@ -150,26 +151,8 @@ def build_leave_template() -> bytes:
     wb = openpyxl.Workbook()
     wb.remove(wb.active)  # Remove default blank sheet
 
-    header_fill = PatternFill("solid", fgColor=NAVY)
-    header_font = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
-    body_font = Font(name="Segoe UI", size=10, color="1F2937")
-    thin = Side(style="thin", color="D1D5DB")
-
     def _style_sheet(ws, widths: dict[str, int]):
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = Border(bottom=thin)
-        for row in ws.iter_rows(min_row=2, max_row=500, max_col=len(widths)):
-            for cell in row:
-                cell.font = body_font
-                cell.border = Border(bottom=thin)
-        for col_letter, w in widths.items():
-            ws.column_dimensions[col_letter].width = w
-        ws.freeze_panes = "A2"
-        last_col_letter = list(widths.keys())[-1]
-        ws.auto_filter.ref = f"A1:{last_col_letter}500"
+        style_template_sheet(ws, widths)
 
     # 1. Cuti_Izin
     ws_cuti = wb.create_sheet(title=SHEET_CUTI_IZIN)
@@ -218,13 +201,7 @@ def build_leave_template() -> bytes:
     for row in guide_rows:
         guide.append(row)
 
-    guide["A1"].font = Font(name="Segoe UI", size=13, bold=True, color=WHITE)
-    guide["A1"].fill = header_fill
-    guide.merge_cells("A1:B1")
-    for row in guide.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = body_font
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    style_guide_sheet(guide)
     guide.column_dimensions["A"].width = 28
     guide.column_dimensions["B"].width = 85
 

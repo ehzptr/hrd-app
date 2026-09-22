@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, time
+from pathlib import Path
 from typing import Any, Optional
 
 import flet as ft
@@ -8,6 +10,7 @@ import flet as ft
 from application.config import AppConfig, AttendanceConfig, PayrollConfig, ScoreConfig, SalesScoreConfig
 from services.models import PipelineRequest, UploadedFile
 from services.pipeline import run_attendance_pipeline
+from ui.view_models import ConfigViewModel, ResultViewModel, UploadViewModel
 
 
 class FletDashboardState:
@@ -31,6 +34,9 @@ class FletDashboardState:
         self.file_pickers: dict[str, ft.FilePicker] = {}
         self.upload_labels: dict[str, ft.Text] = {}
         self.config_fields: dict[str, ft.Control] = {}
+        self.upload_view_model = UploadViewModel(self.uploads, self.upload_names)
+        self.config_view_model = ConfigViewModel(self.config_fields)
+        self.result_view_model = ResultViewModel()
 
         self.status = ft.Text("Menunggu upload data...")
         self.process_button = ft.Button(
@@ -43,13 +49,20 @@ class FletDashboardState:
         )
         self.results_view = ft.Column(expand=True)
 
-    async def handle_file_pick(self, kind: str, event: ft.FilePickerResultEvent) -> None:
-        if not event.files:
+    async def handle_file_pick(self, kind: str, files: list[ft.FilePickerFile]) -> None:
+        """Store the file returned by the Flet 1.x pick_files service call."""
+        if not files:
             return
 
-        selected = event.files[0]
+        selected = files[0]
         try:
-            content = await selected.read()
+            # Flet 1.0 exposes selected bytes (when requested with_data=True)
+            # rather than the removed FilePickerFile.read() coroutine.
+            content = selected.bytes
+            if content is None and selected.path:
+                content = Path(selected.path).read_bytes()
+            if content is None:
+                raise ValueError("File picker tidak mengembalikan isi file.")
         except Exception as exc:  # pragma: no cover - UI fallback
             self.error = f"Gagal membaca {kind}: {exc}"
             self.uploads[kind] = None
@@ -76,6 +89,7 @@ class FletDashboardState:
         try:
             request = self.build_request()
             self.result = await self.run_pipeline(request)
+            self.result_view_model.payload = self.result
             self.status.value = "Selesai"
             self.render_results()
         except Exception as exc:
@@ -86,48 +100,52 @@ class FletDashboardState:
             self.page.update()
 
     async def run_pipeline(self, request: PipelineRequest) -> dict[str, Any]:
-        return await self.page.run_task(
-            run_attendance_pipeline,
-            request.attendance.content,
-            request.attendance.filename,
-            request.master.content if request.master else None,
-            request.leave.content if request.leave else None,
-            request.master.filename if request.master else "",
-            request.leave.filename if request.leave else "",
-            request.sales.content if request.sales else None,
-            request.sales.filename if request.sales else "",
-            request.config.attendance.clock_in.isoformat(),
-            request.config.attendance.weekday_clock_out.isoformat(),
-            request.config.attendance.saturday_clock_out.isoformat(),
-            request.config.attendance.grace_minutes,
-            request.config.attendance.saturday_is_working,
-            request.config.attendance.sunday_is_off,
-            request.config.attendance.start_date,
-            request.config.attendance.end_date,
-            tuple(sorted(str(d) for d in request.holidays)),
-            (
-                request.config.score.excellent_threshold,
-                request.config.score.good_threshold,
-                request.config.score.watch_threshold,
-            ),
-            {
-                "late_deduction_mode": request.config.payroll.late_deduction_mode,
-                "late_deduction_per_minute": request.config.payroll.late_deduction_per_minute,
-                "late_deduction_per_occurrence": request.config.payroll.late_deduction_per_occurrence,
-                "sales_no_clock_out_deduction": request.config.payroll.sales_no_clock_out_deduction,
-                "early_leave_deduction_per_minute": request.config.payroll.early_leave_deduction_per_minute,
-                "absence_deduction_per_day": request.config.payroll.absence_deduction_per_day,
-                "other_deduction_note": request.config.payroll.other_deduction_note,
-            },
-            {
-                "weight_visit": request.config.sales_score.weight_visit,
-                "weight_test_drive": request.config.sales_score.weight_test_drive,
-                "weight_spk": request.config.sales_score.weight_spk,
-                "weight_delivery": request.config.sales_score.weight_delivery,
-                "weight_conversion_rate": request.config.sales_score.weight_conversion_rate,
-            },
-            request.overtime_hourly_rate,
-        )
+        async def run_pipeline_task() -> dict[str, Any]:
+            """Adapt the synchronous business pipeline to Flet's async task API."""
+            return await asyncio.to_thread(
+                run_attendance_pipeline,
+                request.attendance.content,
+                request.attendance.filename,
+                request.master.content if request.master else None,
+                request.leave.content if request.leave else None,
+                request.master.filename if request.master else "",
+                request.leave.filename if request.leave else "",
+                request.sales.content if request.sales else None,
+                request.sales.filename if request.sales else "",
+                request.config.attendance.clock_in.isoformat(),
+                request.config.attendance.weekday_clock_out.isoformat(),
+                request.config.attendance.saturday_clock_out.isoformat(),
+                request.config.attendance.grace_minutes,
+                request.config.attendance.saturday_is_working,
+                request.config.attendance.sunday_is_off,
+                request.config.attendance.start_date,
+                request.config.attendance.end_date,
+                tuple(sorted(str(d) for d in request.holidays)),
+                (
+                    request.config.score.excellent_threshold,
+                    request.config.score.good_threshold,
+                    request.config.score.watch_threshold,
+                ),
+                {
+                    "late_deduction_mode": request.config.payroll.late_deduction_mode,
+                    "late_deduction_per_minute": request.config.payroll.late_deduction_per_minute,
+                    "late_deduction_per_occurrence": request.config.payroll.late_deduction_per_occurrence,
+                    "sales_no_clock_out_deduction": request.config.payroll.sales_no_clock_out_deduction,
+                    "early_leave_deduction_per_minute": request.config.payroll.early_leave_deduction_per_minute,
+                    "absence_deduction_per_day": request.config.payroll.absence_deduction_per_day,
+                    "other_deduction_note": request.config.payroll.other_deduction_note,
+                },
+                {
+                    "weight_visit": request.config.sales_score.weight_visit,
+                    "weight_test_drive": request.config.sales_score.weight_test_drive,
+                    "weight_spk": request.config.sales_score.weight_spk,
+                    "weight_delivery": request.config.sales_score.weight_delivery,
+                    "weight_conversion_rate": request.config.sales_score.weight_conversion_rate,
+                },
+                request.overtime_hourly_rate,
+            )
+
+        return await asyncio.wrap_future(self.page.run_task(run_pipeline_task))
 
     def _field_value(self, key: str, default: Any = None) -> Any:
         control = self.config_fields.get(key)
@@ -234,23 +252,10 @@ class FletDashboardState:
         )
 
     def render_results(self) -> None:
-        self.results_view.controls.clear()
+        # Kept as a compatibility method for callers of the previous state API.
+        from ui.panels.results import render_results
 
-        if self.result is not None:
-            period_label = self.result.get("period_label", "")
-            self.results_view.controls.append(
-                ft.Text(f"Periode: {period_label or 'Tidak tersedia'}", size=20, weight=ft.FontWeight.BOLD)
-            )
-            if "employee_summary" in self.result and not self.result["employee_summary"].is_empty():
-                self.results_view.controls.append(
-                    ft.Text(
-                        f"Karyawan: {self.result['employee_summary'].height}",
-                        size=14,
-                        color="#475569",
-                    )
-                )
-
-        self.page.update()
+        render_results(self)
 
 
 # For compatibility with the previous app entrypoints.

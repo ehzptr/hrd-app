@@ -63,7 +63,19 @@ def _normalize_dataframe(value: Any) -> pl.DataFrame:
     if isinstance(value, pl.DataFrame):
         return value
 
-    return pl.DataFrame(value)
+    schema_overrides: dict[str, pl.DataType] = {}
+    if isinstance(value, dict):
+        for name, values in value.items():
+            if isinstance(values, (list, tuple)) and values and all(item is None for item in values):
+                schema_overrides[str(name)] = pl.String
+    elif isinstance(value, list) and all(isinstance(row, dict) for row in value):
+        names = {str(name) for row in value for name in row}
+        for name in names:
+            values = [row.get(name) for row in value]
+            if values and all(item is None for item in values):
+                schema_overrides[name] = pl.String
+
+    return pl.DataFrame(value, schema_overrides=schema_overrides or None)
 
 
 def read_table(

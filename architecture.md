@@ -21,16 +21,19 @@ src/
     payslip.py
 
   ui/
-    common/
-      formatters.py
-      view_models.py       # new
-    flet_app/
-      app.py               # new Flet entrypoint
-      page_state.py        # new
-      upload_panel.py
-      config_panel.py
-      results_view.py
-      tables.py
-      charts.py
+    components.py          # Shared Flet controls
+    formatters.py          # Presentation formatting
+    view_models.py         # Typed UI state models
+    panels/
+      upload.py            # Uploads and template downloads
+      config.py            # Schedule, scoring and payroll inputs
+      results.py           # Results presentation
+    page.py                # Page composition
+    sidebar.py             # Sidebar composition
+    state.py               # UI event orchestration
 
-  hr_nicegui/              # temporary compatibility package
+  reporting/
+    models.py              # ReportData and provenance metadata
+    styles.py              # Shared workbook styles
+    excel_utils.py         # Shared table/template helpers
+    excel_report.py        # Audit workbook renderer

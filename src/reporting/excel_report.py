@@ -9,107 +9,42 @@ raw scans and rejected rows.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+import hashlib
+import json
+import datetime as dt
 from typing import Optional
 
 import polars as pl
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
 from application.config import AppConfig, config_to_dataframe
-
-NAVY = "1F4E78"
-DARK_SLATE = "2F5597"
-ACCENT_BLUE = "D9E1F2"
-LIGHT_GRAY = "F2F2F2"
-WHITE = "FFFFFF"
-BORDER_GRAY = "D9D9D9"
-
-HEADER_FILL = PatternFill("solid", fgColor=NAVY)
-HEADER_FONT = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
-SECTION_FILL = PatternFill("solid", fgColor=DARK_SLATE)
-SECTION_FONT = Font(name="Segoe UI", size=11, bold=True, color=WHITE)
-CARD_VALUE_FONT = Font(name="Segoe UI", size=20, bold=True, color=NAVY)
-CARD_LABEL_FONT = Font(name="Segoe UI", size=9, bold=False, color="595959")
-INSIGHT_FONT = Font(name="Segoe UI", size=10, italic=False, color="1F4E78")
-INSIGHT_HEADER_FONT = Font(name="Segoe UI", size=11, bold=True, color=NAVY)
-
-THIN_SIDE = Side(border_style="thin", color=BORDER_GRAY)
-CARD_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
-
-
-@dataclass
-class ReportData:
-    config: AppConfig
-    employee_master: pl.DataFrame
-    raw_log: pl.DataFrame
-    daily_attendance: pl.DataFrame
-    employee_summary: pl.DataFrame
-    department_summary: pl.DataFrame
-    daily_trend: pl.DataFrame
-    anomalies: pl.DataFrame
-    rejected: pl.DataFrame
-    payroll: pl.DataFrame
-    sales_activity: pl.DataFrame
-    sales_performance: pl.DataFrame
-    insights: list[str]
-    report_period_label: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Generic sheet helpers
-# ---------------------------------------------------------------------------
-
-
-def _write_table(ws: Worksheet, df: Optional[pl.DataFrame], start_row: int = 1, start_col: int = 1) -> tuple[int, int]:
-    """Write a styled table starting at (start_row, start_col). Returns the
-    (last_row, last_col) written."""
-    if df is None or df.is_empty():
-        cell = ws.cell(row=start_row, column=start_col, value="(Tidak ada data)")
-        cell.font = Font(italic=True, color="7F7F7F")
-        return start_row, start_col
-
-    for j, col_name in enumerate(df.columns):
-        cell = ws.cell(row=start_row, column=start_col + j, value=str(col_name))
-        cell.font = HEADER_FONT
-        cell.fill = HEADER_FILL
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    for i, row in enumerate(df.iter_rows(named=False), start=1):
-        for j, value in enumerate(row):
-            cell = ws.cell(row=start_row + i, column=start_col + j, value=value)
-            if i % 2 == 0:
-                cell.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-
-    last_row = start_row + len(df)
-    last_col = start_col + len(df.columns) - 1
-    ws.auto_filter.ref = (
-        f"{get_column_letter(start_col)}{start_row}:{get_column_letter(last_col)}{last_row}"
-    )
-    ws.freeze_panes = ws.cell(row=start_row + 1, column=start_col).coordinate
-    return last_row, last_col
-
-
-def _autofit(ws: Worksheet, max_scan_row: int = 2000) -> None:
-    for col_idx in range(1, ws.max_column + 1):
-        letter = get_column_letter(col_idx)
-        longest = 0
-        for row_idx in range(1, min(ws.max_row, max_scan_row) + 1):
-            value = ws.cell(row_idx, col_idx).value
-            if value is not None:
-                longest = max(longest, len(str(value)))
-        ws.column_dimensions[letter].width = min(max(longest + 2, 10), 42)
-
-
-def _data_sheet(wb: Workbook, name: str, df: Optional[pl.DataFrame]) -> Worksheet:
-    ws = wb.create_sheet(name)
-    ws.sheet_view.showGridLines = False
-    _write_table(ws, df)
-    _autofit(ws)
-    return ws
+from reporting.excel_utils import (
+    autofit as _autofit,
+    data_sheet as _data_sheet,
+    write_table as _write_table,
+)
+from reporting.models import ReportData
+from reporting.styles import (
+    ACCENT_BLUE,
+    BORDER_GRAY,
+    CARD_BORDER,
+    CARD_LABEL_FONT,
+    CARD_VALUE_FONT,
+    DARK_SLATE,
+    HEADER_FILL,
+    HEADER_FONT,
+    INSIGHT_FONT,
+    INSIGHT_HEADER_FONT,
+    LIGHT_GRAY,
+    NAVY,
+    SECTION_FILL,
+    SECTION_FONT,
+    THIN_SIDE,
+    WHITE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +254,24 @@ README_ROWS = [
 ]
 
 
-def _build_readme(wb: Workbook) -> None:
+def _timestamp(value: dt.datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc).isoformat()
+
+
+def _build_readme(wb: Workbook, data: ReportData) -> None:
     ws = wb.create_sheet("README")
     ws.sheet_view.showGridLines = False
-    for i, (label, desc) in enumerate(README_ROWS, start=1):
+    rows = [
+        *README_ROWS[:3],
+        ("Generated At (UTC)", _timestamp(data.generated_at)),
+        ("Report Period", data.report_period_label or "(not specified)"),
+        ("Input Files", ", ".join(data.source_files) or "(not provided)"),
+        ("", ""),
+        *README_ROWS[3:],
+    ]
+    for i, (label, desc) in enumerate(rows, start=1):
         c1 = ws.cell(row=i, column=1, value=label)
         c2 = ws.cell(row=i, column=2, value=desc)
         if desc == "" and label:
@@ -334,6 +283,45 @@ def _build_readme(wb: Workbook) -> None:
             c2.alignment = Alignment(wrap_text=True, vertical="top")
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 110
+
+
+def _build_provenance(wb: Workbook, data: ReportData) -> None:
+    """Write machine-readable provenance and row-count metadata."""
+    ws = wb.create_sheet("PROVENANCE")
+    ws.sheet_view.showGridLines = False
+    config_df = config_to_dataframe(data.config)
+    row_counts = {
+        "CONFIG": len(config_df),
+        "EMPLOYEE_MASTER": len(data.employee_master),
+        "RAW_LOG": len(data.raw_log),
+        "DAILY_ATTENDANCE": len(data.daily_attendance),
+        "EMPLOYEE_SUMMARY": len(data.employee_summary),
+        "DEPARTMENT_SUMMARY": len(data.department_summary),
+        "DAILY_TREND": len(data.daily_trend),
+        "ANOMALY": len(data.anomalies),
+        "PAYROLL": len(data.payroll),
+        "SALES_PERFORMANCE": len(data.sales_performance),
+        "Sales_Activity": len(data.sales_activity),
+        "REJECTED": len(data.rejected),
+    }
+    config_hash = hashlib.sha256(
+        json.dumps(config_df.to_dicts(), default=str, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    rows: list[tuple[str, object]] = [
+        ("generated_at", _timestamp(data.generated_at)),
+        ("report_period", data.report_period_label),
+        ("source_files", json.dumps(data.source_files, ensure_ascii=False)),
+        ("config_sha256", config_hash),
+        ("generator", "hrd-app reporting"),
+        ("sales_provenance", "Derived only from Sales_Activity, never fingerprint scans."),
+    ]
+    rows.extend((f"row_count.{name}", count) for name, count in row_counts.items())
+    rows.extend((f"metadata.{key}", value) for key, value in data.metadata.items())
+    for row, (label, value) in enumerate(rows, start=1):
+        ws.cell(row=row, column=1, value=label).font = Font(bold=True, color=NAVY)
+        ws.cell(row=row, column=2, value=value)
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 100
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +345,8 @@ def generate_workbook(data: ReportData) -> bytes:
     _data_sheet(wb, "Sales_Activity", data.sales_activity)
     if data.rejected is not None and not data.rejected.is_empty():
         _data_sheet(wb, "Data_Ditolak", data.rejected)
-    _build_readme(wb)
+    _build_readme(wb, data)
+    _build_provenance(wb, data)
 
     for ws in wb.worksheets:
         if ws.title != "DASHBOARD":

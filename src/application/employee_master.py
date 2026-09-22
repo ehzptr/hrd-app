@@ -18,6 +18,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.datavalidation import DataValidation
 
+from reporting.excel_utils import style_guide_sheet, style_template_sheet
+
 EMPLOYEE_MASTER_COLUMNS = [
     "No.",
     "Name",
@@ -314,21 +316,11 @@ def build_employee_master_template() -> bytes:
     ws.append(["EMP001", "Budi Santoso", "Sales Mobil Baru", "Sales Executive", "SALES", "08:30", "17:30", 5500000, "Y"])
     ws.append(["EMP002", "Sari Wijaya", "HRD & Admin", "Staff HRD", "OFFICE", "08:00", "17:00", 6000000, "Y"])
 
-    header_fill = PatternFill("solid", fgColor=NAVY)
-    header_font = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
-    body_font = Font(name="Segoe UI", size=10, color="1F2937")
-    thin = Side(style="thin", color="D1D5DB")
-
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(bottom=thin)
-
-    for row in ws.iter_rows(min_row=2, max_row=1000, max_col=len(EMPLOYEE_MASTER_COLUMNS)):
-        for cell in row:
-            cell.font = body_font
-            cell.border = Border(bottom=thin)
+    style_template_sheet(
+        ws,
+        {"A": 14, "B": 22, "C": 20, "D": 20, "E": 14, "F": 14, "G": 14, "H": 16, "I": 10},
+        max_rows=1000,
+    )
 
     dv_type = DataValidation(type="list", formula1='"OFFICE,SALES"', allow_blank=True)
     dv_type.error = "Pilih OFFICE atau SALES."
@@ -339,12 +331,6 @@ def build_employee_master_template() -> bytes:
     dv_active = DataValidation(type="list", formula1='"Y,N"', allow_blank=True)
     ws.add_data_validation(dv_active)
     dv_active.add("I2:I1000")
-
-    widths = {"A": 14, "B": 22, "C": 20, "D": 20, "E": 14, "F": 14, "G": 14, "H": 16, "I": 10}
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = "A1:I1000"
 
     guide_rows = [
         ["PETUNJUK EMPLOYEE MASTER"],
@@ -360,13 +346,7 @@ def build_employee_master_template() -> bytes:
     ]
     for row in guide_rows:
         guide.append(row)
-    guide["A1"].font = Font(name="Segoe UI", size=14, bold=True, color=WHITE)
-    guide["A1"].fill = header_fill
-    guide.merge_cells("A1:B1")
-    for row in guide.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = body_font
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    style_guide_sheet(guide)
     guide.column_dimensions["A"].width = 18
     guide.column_dimensions["B"].width = 90
 

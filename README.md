@@ -1,5 +1,26 @@
 # HrdApp app
 
+## Architecture
+
+The application is organized into independent processing and presentation
+layers:
+
+- `src/attendance` cleans scan data, calculates daily attendance, and derives
+  attendance analytics.
+- `src/application` contains configurable HR, leave, payroll, employee-master,
+  and sales rules.
+- `src/services` loads files and orchestrates the processing pipeline.
+- `src/ui` contains the Flet page, typed view models, and upload/config/results
+  panels. Results tables use `flet-datatable2` for sticky headers, fixed
+  columns, and horizontal scrolling.
+- `src/reporting` renders Excel audit workbooks. Shared styles and template
+  helpers are in `styles.py` and `excel_utils.py`.
+
+Generated workbooks include a `PROVENANCE` sheet containing the UTC generation
+timestamp, report period, source filenames, configuration hash, row counts,
+and caller-provided metadata. This provides an audit trail without changing
+the calculation data.
+
 ## Run the app
 
 ### uv
