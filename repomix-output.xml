@@ -4320,9 +4320,49 @@ def run_attendance_pipeline(
 </file>
 
 <file path="src/ui/page.py">
+from __future__ import annotations
+
 import flet as ft
 
 from ui.state import FletDashboardState
+
+
+def build_sidebar(state: FletDashboardState) -> ft.Container:
+    return ft.Container(
+        width=300,
+        padding=20,
+        bgcolor="#F1F5F9",
+        content=ft.Column(
+            controls=[
+                ft.Text(
+                    "HR Dashboard",
+                    size=24,
+                    weight=ft.FontWeight.BOLD,
+                    color="#0F2B46",
+                ),
+                ft.Text(
+                    "Attendance · Payroll · Sales",
+                    size=12,
+                    color="#475569",
+                ),
+                ft.Divider(),
+                ft.Text(
+                    "Upload Data",
+                    size=16,
+                    weight=ft.FontWeight.BOLD,
+                ),
+                ft.Text(
+                    "File upload controls will be added here.",
+                    size=12,
+                    color="#64748B",
+                ),
+                ft.Divider(),
+                state.status,
+                state.process_button,
+            ],
+            spacing=12,
+        ),
+    )
 
 
 def build_page(page: ft.Page) -> None:
@@ -4360,11 +4400,17 @@ class FletDashboardState:
         self.error: str | None = None
 
         self.status = ft.Text("Menunggu upload data...")
-        self.process_button = ft.ElevatedButton(
-            "Proses Data",
+
+        self.process_button = ft.Button(
+            content="Proses Data",
             icon=ft.Icons.PLAY_ARROW,
             on_click=self.process,
+            style=ft.ButtonStyle(
+                bgcolor="#0d9488",
+                color="#ffffff",
+            ),
         )
+
         self.results_view = ft.Column(expand=True)
 
     async def process(self, event: ft.ControlEvent) -> None:
@@ -4384,8 +4430,7 @@ class FletDashboardState:
             self.process_button.disabled = False
             self.page.update()
 
-    async def run_pipeline(self, request: PipelineRequest):
-        # Run synchronous Polars/OpenPyXL work away from the UI event loop.
+    async def run_pipeline(self, request: PipelineRequest) -> PipelineResult:
         return await self.page.run_task(run_attendance_pipeline, request)
 
     def build_request(self) -> PipelineRequest:
@@ -4393,16 +4438,16 @@ class FletDashboardState:
 
     def render_results(self) -> None:
         self.results_view.controls.clear()
-        if self.result is None:
-            return
 
-        self.results_view.controls.append(
-            ft.Text(
-                f"Periode: {self.result.period_label}",
-                size=20,
-                weight=ft.FontWeight.BOLD,
+        if self.result is not None:
+            self.results_view.controls.append(
+                ft.Text(
+                    f"Periode: {self.result.period_label}",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
+                )
             )
-        )
+
         self.page.update()
 </file>
 
