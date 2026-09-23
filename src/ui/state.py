@@ -1,22 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import flet as ft
 
 from application.config import AppConfig, AttendanceConfig, PayrollConfig, ScoreConfig, SalesScoreConfig
-from services.models import PipelineRequest, UploadedFile
-from services.pipeline import run_attendance_pipeline
+from services.models import PipelineRequest, PipelineResult, UploadedFile
+from services.pipeline import run_pipeline
 from ui.view_models import ConfigViewModel, ResultViewModel, UploadViewModel
+
+LOGGER = logging.getLogger(__name__)
 
 
 class FletDashboardState:
     def __init__(self, page: ft.Page) -> None:
         self.page = page
-        self.result: dict[str, Any] | None = None
+        self.result: PipelineResult | None = None
         self.error: str | None = None
 
         self.uploads: dict[str, UploadedFile | None] = {
@@ -93,57 +96,17 @@ class FletDashboardState:
             self.status.value = "Selesai"
             self.render_results()
         except Exception as exc:
+            LOGGER.exception("Pipeline failed while processing uploaded files")
             self.error = str(exc)
             self.status.value = f"Error: {self.error}"
         finally:
             self.process_button.disabled = False
             self.page.update()
 
-    async def run_pipeline(self, request: PipelineRequest) -> dict[str, Any]:
-        async def run_pipeline_task() -> dict[str, Any]:
+    async def run_pipeline(self, request: PipelineRequest) -> PipelineResult:
+        async def run_pipeline_task() -> PipelineResult:
             """Adapt the synchronous business pipeline to Flet's async task API."""
-            return await asyncio.to_thread(
-                run_attendance_pipeline,
-                request.attendance.content,
-                request.attendance.filename,
-                request.master.content if request.master else None,
-                request.leave.content if request.leave else None,
-                request.master.filename if request.master else "",
-                request.leave.filename if request.leave else "",
-                request.sales.content if request.sales else None,
-                request.sales.filename if request.sales else "",
-                request.config.attendance.clock_in.isoformat(),
-                request.config.attendance.weekday_clock_out.isoformat(),
-                request.config.attendance.saturday_clock_out.isoformat(),
-                request.config.attendance.grace_minutes,
-                request.config.attendance.saturday_is_working,
-                request.config.attendance.sunday_is_off,
-                request.config.attendance.start_date,
-                request.config.attendance.end_date,
-                tuple(sorted(str(d) for d in request.holidays)),
-                (
-                    request.config.score.excellent_threshold,
-                    request.config.score.good_threshold,
-                    request.config.score.watch_threshold,
-                ),
-                {
-                    "late_deduction_mode": request.config.payroll.late_deduction_mode,
-                    "late_deduction_per_minute": request.config.payroll.late_deduction_per_minute,
-                    "late_deduction_per_occurrence": request.config.payroll.late_deduction_per_occurrence,
-                    "sales_no_clock_out_deduction": request.config.payroll.sales_no_clock_out_deduction,
-                    "early_leave_deduction_per_minute": request.config.payroll.early_leave_deduction_per_minute,
-                    "absence_deduction_per_day": request.config.payroll.absence_deduction_per_day,
-                    "other_deduction_note": request.config.payroll.other_deduction_note,
-                },
-                {
-                    "weight_visit": request.config.sales_score.weight_visit,
-                    "weight_test_drive": request.config.sales_score.weight_test_drive,
-                    "weight_spk": request.config.sales_score.weight_spk,
-                    "weight_delivery": request.config.sales_score.weight_delivery,
-                    "weight_conversion_rate": request.config.sales_score.weight_conversion_rate,
-                },
-                request.overtime_hourly_rate,
-            )
+            return await asyncio.to_thread(run_pipeline, request)
 
         return await asyncio.wrap_future(self.page.run_task(run_pipeline_task))
 

@@ -11,6 +11,7 @@ Supported extensions:
 """
 
 import io
+import logging
 import warnings
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,13 @@ from typing import Any
 import polars as pl
 
 SUPPORTED_EXTENSIONS = (".xlsx", ".xls", ".csv")
+
+
+class _FastexcelDtypeFallbackFilter(logging.Filter):
+    """Hide fastexcel's expected mixed-column fallback notice."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Could not determine dtype for column" not in record.getMessage()
 
 
 class UnsupportedFileTypeError(ValueError):
@@ -48,14 +56,19 @@ def _read_excel(file_bytes: bytes, **kwargs: Any) -> Any:
     Polars currently emits a FutureWarning from its internal
     Arrow conversion path with some fastexcel/pyarrow combinations.
     """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=FutureWarning)
-
-        return pl.read_excel(
-            io.BytesIO(file_bytes),
-            engine="calamine",
-            **kwargs,
-        )
+    logger = logging.getLogger("fastexcel.types.dtype")
+    fallback_filter = _FastexcelDtypeFallbackFilter()
+    logger.addFilter(fallback_filter)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=FutureWarning)
+            return pl.read_excel(
+                io.BytesIO(file_bytes),
+                engine="calamine",
+                **kwargs,
+            )
+    finally:
+        logger.removeFilter(fallback_filter)
 
 
 def _normalize_dataframe(value: Any) -> pl.DataFrame:

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from services.models import UploadedFile
+from services.models import PipelineResult, UploadedFile
 
 
 @dataclass
@@ -27,4 +27,4 @@ class ConfigViewModel:
 class ResultViewModel:
     """Result payload exposed to the results panel."""
 
-    payload: dict[str, Any] | None = None
+    payload: PipelineResult | None = None

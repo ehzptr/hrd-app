@@ -15,11 +15,11 @@ from typing import Any
 
 import flet as ft
 import polars as pl
-from flet_datatable2 import DataColumn2, DataColumnSize, DataRow2, DataTable2
 
 from ui.components import BORDER, NAVY, SLATE_500, TEAL, card
 from ui.formatters import format_period
 from reporting.payslip import generate_bulk_payslip_excel, generate_bulk_payslip_pdf
+from services.models import PipelineResult
 from ui.state import FletDashboardState
 
 MUTED = SLATE_500
@@ -33,8 +33,8 @@ def build_results_panel(state: FletDashboardState) -> ft.Column:
     return ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=18)
 
 
-def _frame(result: dict[str, Any], key: str) -> pl.DataFrame:
-    value = result.get(key)
+def _frame(result: PipelineResult, key: str) -> pl.DataFrame:
+    value = getattr(result, key, None)
     return value if isinstance(value, pl.DataFrame) else pl.DataFrame()
 
 
@@ -118,46 +118,81 @@ def _kpi(label: str, value: str, detail: str = "", accent: str = TEAL) -> ft.Con
     )
 
 
-def _table(df: pl.DataFrame, columns: list[str], limit: int = 8) -> ft.Control:
+def _table(df: pl.DataFrame, columns: list[str], limit: int = 8) -> ft.Container:
     available = [column for column in columns if column in df.columns]
     if df.is_empty() or not available:
         return _empty()
+
+    rows = df.select(available).head(limit).to_dicts()
+
+    def handle_row_selection_change(e: ft.ControlEvent) -> None:
+        e.control.selected = not e.control.selected
+        e.control.update()
+
+    def sort_column(e: ft.DataColumnSortEvent) -> None:
+        column = available[e.column_index]
+        rows.sort(
+            key=lambda row: (
+                row.get(column) is None,
+                row.get(column) if row.get(column) is not None else "",
+            ),
+            reverse=not e.ascending,
+        )
+        table.rows = get_data_rows(rows)
+        table.sort_column_index = e.column_index
+        table.sort_ascending = e.ascending
+        table.update()
+
+    def get_data_columns() -> list[ft.DataColumn]:
+        return [
+            ft.DataColumn(
+                label=ft.Text(
+                    column.replace("_", " "),
+                    size=11,
+                    weight=ft.FontWeight.BOLD,
+                ),
+                on_sort=sort_column,
+                numeric=index > 0,
+            )
+            for index, column in enumerate(available)
+        ]
+
+    def get_data_rows(items: list[dict[str, Any]]) -> list[ft.DataRow]:
+        return [
+            ft.DataRow(
+                on_select_change=handle_row_selection_change,
+                cells=[
+                    ft.DataCell(ft.Text(_display(row.get(column), column), size=12))
+                    for column in available
+                ],
+            )
+            for row in items
+        ]
+
+    table = ft.DataTable(
+        expand=True,
+        show_checkbox_column=True,
+        columns=get_data_columns(),
+        rows=get_data_rows(rows),
+        column_spacing=18,
+        heading_row_color="#F1F5F9",
+        heading_row_height=42,
+        data_row_min_height=42,
+        data_row_max_height=42,
+        border=ft.Border.all(1, "#E2E8F0"),
+        horizontal_lines=ft.BorderSide(1, "#E2E8F0"),
+    )
+
     return ft.Container(
         height=310,
-        content=DataTable2(
-            columns=[
-                DataColumn2(
-                    ft.Text(col.replace("_", " "), size=11, weight=ft.FontWeight.BOLD),
-                    size=DataColumnSize.S,
-                )
-                for col in available
-            ],
-            rows=[
-                DataRow2(
-                    cells=[
-                        ft.DataCell(ft.Text(_display(row.get(col), col), size=12))
-                        for col in available
-                    ],
-                )
-                for row in df.select(available).head(limit).to_dicts()
-            ],
-            column_spacing=18,
-            heading_row_color="#F1F5F9",
-            heading_row_height=42,
-            data_row_height=42,
-            border=ft.Border.all(1, "#E2E8F0"),
-            horizontal_lines=ft.BorderSide(1, "#E2E8F0"),
-            fixed_top_rows=1,
-            fixed_left_columns=1,
-            fixed_columns_color="#F8FAFC",
-            min_width=max(640, len(available) * 130),
-            visible_horizontal_scroll_bar=True,
-            visible_vertical_scroll_bar=True,
-        ),
+        expand=True,
+        content=table,
     )
 
 
-def _section(label: str, content: ft.Control, subtitle: str | None = None) -> ft.Container:
+def _section(
+    label: str, content: ft.Control, subtitle: str | None = None
+) -> ft.Container:
     return card(ft.Column(controls=[_title(label, subtitle), content], spacing=12))
 
 
@@ -193,35 +228,59 @@ def _save_bytes_button(
 
 
 def _dashboard(state: FletDashboardState) -> list[ft.Control]:
-    result = state.result or {}
+    result = state.result
+    if result is None:
+        return [
+            _empty("Belum ada hasil. Upload data attendance lalu klik Proses Data.")
+        ]
     summary = _frame(result, "employee_summary")
     departments = _frame(result, "department_summary")
     anomalies = _frame(result, "anomalies")
     payroll = _frame(result, "payroll")
     sales = _frame(result, "sales_performance")
-    payslips = result.get("payslips") or []
-    payslip_rows = [
-        asdict(slip) for slip in payslips
-        if is_dataclass(slip)
-    ]
+    payslips = result.payslips
+    payslip_rows = [asdict(slip) for slip in payslips if is_dataclass(slip)]
     payslip_frame = pl.DataFrame(payslip_rows) if payslip_rows else pl.DataFrame()
-    insights = result.get("insights") or []
+    insights = result.insights
 
     employees = summary.height
-    avg_score = summary["Attendance_Score"].mean() if "Attendance_Score" in summary.columns and employees else 100.0
-    attendance = summary["Attendance_Rate_%"].mean() if "Attendance_Rate_%" in summary.columns and employees else 100.0
-    late = summary["Terlambat"].sum() if "Terlambat" in summary.columns and employees else 0
-    absent = summary["Mangkir"].sum() if "Mangkir" in summary.columns and employees else 0
-    revenue = sales["Revenue"].sum() if "Revenue" in sales.columns and not sales.is_empty() else 0
+    avg_score = (
+        summary["Attendance_Score"].mean()
+        if "Attendance_Score" in summary.columns and employees
+        else 100.0
+    )
+    attendance = (
+        summary["Attendance_Rate_%"].mean()
+        if "Attendance_Rate_%" in summary.columns and employees
+        else 100.0
+    )
+    late = (
+        summary["Terlambat"].sum()
+        if "Terlambat" in summary.columns and employees
+        else 0
+    )
+    absent = (
+        summary["Mangkir"].sum() if "Mangkir" in summary.columns and employees else 0
+    )
+    revenue = (
+        sales["Revenue"].sum()
+        if "Revenue" in sales.columns and not sales.is_empty()
+        else 0
+    )
 
     controls: list[ft.Control] = [
         ft.Row(
             controls=[
                 ft.Column(
                     controls=[
-                        ft.Text("Ringkasan HR", size=27, weight=ft.FontWeight.BOLD, color=NAVY),
                         ft.Text(
-                            f"{format_period(result.get('period_label'))}  ·  Gunakan tabel di bawah untuk tindak lanjut.",
+                            "Ringkasan HR",
+                            size=27,
+                            weight=ft.FontWeight.BOLD,
+                            color=NAVY,
+                        ),
+                        ft.Text(
+                            f"{format_period(result.period_label)}  ·  Gunakan tabel di bawah untuk tindak lanjut.",
                             size=13,
                             color=MUTED,
                         ),
@@ -237,7 +296,12 @@ def _dashboard(state: FletDashboardState) -> list[ft.Control]:
                 _kpi("Karyawan", _fmt_number(employees), "employee summary"),
                 _kpi("Attendance score", _fmt_percent(avg_score), "rata-rata", GREEN),
                 _kpi("Kehadiran", _fmt_percent(attendance), "attendance rate", TEAL),
-                _kpi("Keterlambatan", _fmt_number(late), f"{_fmt_number(absent)} mangkir", AMBER),
+                _kpi(
+                    "Keterlambatan",
+                    _fmt_number(late),
+                    f"{_fmt_number(absent)} mangkir",
+                    AMBER,
+                ),
             ],
             spacing=10,
             run_spacing=10,
@@ -248,7 +312,10 @@ def _dashboard(state: FletDashboardState) -> list[ft.Control]:
         ft.Column(
             controls=[
                 ft.Row(
-                    controls=[ft.Text("•", size=18, color=TEAL), ft.Text(str(text), size=13, expand=True)],
+                    controls=[
+                        ft.Text("•", size=18, color=TEAL),
+                        ft.Text(str(text), size=13, expand=True),
+                    ],
                     spacing=8,
                 )
                 for text in insights
@@ -266,7 +333,15 @@ def _dashboard(state: FletDashboardState) -> list[ft.Control]:
                 "Ringkasan attendance",
                 _table(
                     summary,
-                    ["No.", "Name", "Department", "Attendance_Rate_%", "Terlambat", "Mangkir", "Attendance_Score"],
+                    [
+                        "No.",
+                        "Name",
+                        "Department",
+                        "Attendance_Rate_%",
+                        "Terlambat",
+                        "Mangkir",
+                        "Attendance_Score",
+                    ],
                 ),
                 "Karyawan dengan skor terendah ditampilkan lebih dulu.",
             ),
@@ -274,12 +349,31 @@ def _dashboard(state: FletDashboardState) -> list[ft.Control]:
                 "Ringkasan departemen",
                 _table(
                     departments,
-                    ["Department", "Employee", "Present", "Late", "Absent", "Attendance_Rate_%", "Attendance_Score_%"],
+                    [
+                        "Department",
+                        "Employee",
+                        "Present",
+                        "Late",
+                        "Absent",
+                        "Attendance_Rate_%",
+                        "Attendance_Score_%",
+                    ],
                 ),
             ),
             _section(
                 "Anomali attendance",
-                _table(anomalies, ["Tanggal", "No.", "Name", "Department", "Status_Masuk", "Status_Pulang", "Is_Anomali"]),
+                _table(
+                    anomalies,
+                    [
+                        "Tanggal",
+                        "No.",
+                        "Name",
+                        "Department",
+                        "Status_Masuk",
+                        "Status_Pulang",
+                        "Is_Anomali",
+                    ],
+                ),
                 "Watchlist hari yang membutuhkan tindak lanjut.",
             ),
             _section(
@@ -295,8 +389,18 @@ def _dashboard(state: FletDashboardState) -> list[ft.Control]:
                                     content_factory=lambda: generate_bulk_payslip_pdf(
                                         payslips,
                                         {
-                                            "name": str(state._field_value("company_name", "PT. Dealership Maju Bersama")),
-                                            "address": str(state._field_value("company_address", "Surabaya, Indonesia")),
+                                            "name": str(
+                                                state._field_value(
+                                                    "company_name",
+                                                    "PT. Dealership Maju Bersama",
+                                                )
+                                            ),
+                                            "address": str(
+                                                state._field_value(
+                                                    "company_address",
+                                                    "Surabaya, Indonesia",
+                                                )
+                                            ),
                                         },
                                     ),
                                     disabled=not payslips,
@@ -308,8 +412,18 @@ def _dashboard(state: FletDashboardState) -> list[ft.Control]:
                                     content_factory=lambda: generate_bulk_payslip_excel(
                                         payslips,
                                         {
-                                            "name": str(state._field_value("company_name", "PT. Dealership Maju Bersama")),
-                                            "address": str(state._field_value("company_address", "Surabaya, Indonesia")),
+                                            "name": str(
+                                                state._field_value(
+                                                    "company_name",
+                                                    "PT. Dealership Maju Bersama",
+                                                )
+                                            ),
+                                            "address": str(
+                                                state._field_value(
+                                                    "company_address",
+                                                    "Surabaya, Indonesia",
+                                                )
+                                            ),
                                         },
                                     ),
                                     disabled=not payslips,
@@ -318,13 +432,27 @@ def _dashboard(state: FletDashboardState) -> list[ft.Control]:
                         ),
                         _table(
                             payroll,
-                            ["No.", "Name", "Department", "Monthly_Salary", "Total_Potongan",
-                             "Estimasi_Take_Home", "Total_Menit_Telat"],
+                            [
+                                "No.",
+                                "Name",
+                                "Department",
+                                "Monthly_Salary",
+                                "Total_Potongan",
+                                "Estimasi_Take_Home",
+                                "Total_Menit_Telat",
+                            ],
                         ),
                         _table(
                             payslip_frame,
-                            ["employee_id", "name", "department", "period_label", "total_pendapatan",
-                             "total_potongan", "take_home_pay"],
+                            [
+                                "employee_id",
+                                "name",
+                                "department",
+                                "period_label",
+                                "total_pendapatan",
+                                "total_potongan",
+                                "take_home_pay",
+                            ],
                         ),
                     ],
                 ),
@@ -334,9 +462,20 @@ def _dashboard(state: FletDashboardState) -> list[ft.Control]:
                 "Sales performance",
                 _table(
                     sales,
-                    ["No.", "Name", "Department", "SPK", "Delivery", "Revenue", "Conversion_Rate_%", "Performance_Score"],
+                    [
+                        "No.",
+                        "Name",
+                        "Department",
+                        "SPK",
+                        "Delivery",
+                        "Revenue",
+                        "Conversion_Rate_%",
+                        "Performance_Score",
+                    ],
                 ),
-                f"Total revenue: {_fmt_currency(revenue)}" if not sales.is_empty() else "Belum ada file sales.",
+                f"Total revenue: {_fmt_currency(revenue)}"
+                if not sales.is_empty()
+                else "Belum ada file sales.",
             ),
         ]
     )
